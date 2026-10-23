@@ -1,0 +1,24 @@
+name = "telegram-secretary-bot"
+main = "worker.js"
+
+compatibility_date = "2026-10-23"
+
+# --- Secrets (set via `npx wrangler secret put <NAME>`) ---
+# TELEGRAM_TOKEN      = "8882265865:AAHxPWYwxeZ3edCVpzquf6qwBHegJCvvkYY"
+# LLM_API_KEY         = "sk-..."  (optional, for /chat)
+# LLM_MODEL_NAME      = "llama3.1:8b"  (optional)
+
+# --- KV namespace (set via `npx wrangler kv namespace create REMINDERS`) ---
+[[kv_namespaces]]
+binding = "REMINDERS"
+id = "1f97d34bcaca4def921a4478867c79c5"
+
+# --- Cron: run reminder check every minute --------------------------------
+# The /check endpoint is called by this schedule to fire due reminders.
+# Format: "minute hour day month weekday"
+[[cron]]
+route = "*/1 * * * *"
+trigger = { type = "scheduled", script = "check" }
+
+# --- Build settings --------------------------------------------------------
+# Workers automatically minifies JS. No extra config needed.
