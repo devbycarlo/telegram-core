@@ -174,26 +174,26 @@ function fireMessage(entry) {
 
 const COMMANDS = {
   start: {
-    desc: 'Start the bot and receive a welcome.',
+    desc: 'Start the bot and receive a warm welcome.',
     handler: async (chatId, args) => {
       await sendMessage(chatId, [
-        '👋 *Welcome to Telegram Secretary*',
+        '👋 *Hey there! Welcome to Telegram Secretary!*',
         '',
-        'I am your automated assistant running on Cloudflare\'s edge.',
+        'I\'m your friendly assistant running on Cloudflare\'s edge — think of me as a little robot butler who\'s always ready to help.',
         '',
-        'Available commands:',
-        '• */help* — show this list',
-        '• */echo <text>* — repeat your text back',
-        '• */remind <duration> <text>* — set a persistent reminder',
-        '• */timer <duration>* — start a countdown timer',
-        '• */alarm <time>* — set an alarm (e.g. /alarm 7am, /alarm 7:30pm)',
-        '• */whoami* — show your Telegram user ID',
-        '• */joke* — fetch a random joke',
-        '• */weather <city>* — current weather (free API, no key)',
-        '• */chat <message>* — send a message to AI (requires LLM_API_KEY)',
+        'Here\'s what I can do for you:',
+        '• *Set reminders* — just say \"remind me to read email\" or \"remind me in 5m to call mom\"',
+        '• *Timers* — try \"set a 10 minute timer\" or \"countdown for 5 minutes\"',
+        '• *Alarms* — tell me \"wake me up at 7am\" or \"set an alarm for 7:30pm\"',
+        '• *Weather* — ask \"what\'s the weather in Tokyo\" or \"how\'s the weather in Paris\"',
+        '• *Jokes* — say \"tell me a joke\" or \"something funny\" and I\'ll cheer you up',
+        '• *Chat* — talk to me about anything! Just say \"chat with me\" or \"tell me a fact\"',
+        '• *Echo* — I can repeat things back: \"echo hello\"',
         '',
-        'Send me any text and I will reply.',
-      ].join('\n'), 'Markdown');
+        'No need for the / prefix — just chat with me naturally!',
+        '',
+        'Type /help anytime if you want to see all my commands.',
+      ].join('\\n'), 'Markdown');
     },
   },
   help: {
@@ -202,21 +202,32 @@ const COMMANDS = {
       await sendMessage(chatId, [
         '📖 *Telegram Secretary — Commands*',
         '',
-        '/*start* */                  Show this welcome message',
-        '/*help* */                   Show this list',
-        '/*echo <text>* */             Repeat your text back',
-        '/*remind <dur> <text>* */     Set a persistent reminder',
-        '/*timer <dur>* */             Start a countdown timer',
-        '/*alarm <time>* */            Set an alarm (7am, 7:30pm, 14:00)',
-        '/*whoami* */                  Show your user ID',
-        '/*joke* */                    Fetch a random joke',
-        '/*weather <city>* */           Get current weather (no key needed)',
-        '/*chat <message>* */           Send a message to AI (LLM_API_KEY set)',
+        '/*Slash commands*/',
+        '/*start* */            Show this welcome message',
+        '/*help* */             Show this list',
+        '/*echo <text>* */       Repeat your text back',
+        '/*remind <dur> <text>* */ Set a persistent reminder',
+        '/*timer <dur>* */        Start a countdown timer',
+        '/*alarm <time>* */       Set an alarm (7am, 7:30pm, 14:00)',
+        '/*whoami* */             Show your user ID',
+        '/*joke* */               Fetch a random joke',
+        '/*weather <city>* */      Get current weather (no key needed)',
+        '/*chat <message>* */      Send a message to AI (LLM_API_KEY set)',
         '',
-        'Everything else: I will reply with a short default message.',
+        '/*Natural language commands* */',
+        '• *Reminders:*  "remind me to read email" → "remind me in 5m to call mom"',
+        '• *Timers:*      "set a 10 minute timer" → "countdown for 30 seconds"',
+        '• *Alarms:*      "wake me up at 7am" → "set an alarm for 7:30pm"',
+        '• *Weather:*     "what\'s the weather in Tokyo" → "how\'s the weather in London"',
+        '• *Jokes:*       "tell me a joke" → "something funny"',
+        '• *Chat:*        "chat with me" → "ask me anything"',
+        '• *Echo:*        "echo hello" → "say goodbye"',
+        '• *Help:*        "what can you do" → "show me commands"',
+        '',
+        'You can use /commands or just chat naturally — either way works!',
         '',
         'Tip: use *Markdown* for bold (*text*) and italics (_text_).',
-      ].join('\n'), 'Markdown');
+      ].join('\\n'), 'Markdown');
     },
   },
   echo: {
@@ -224,27 +235,28 @@ const COMMANDS = {
     handler: async (chatId, args) => {
       const text = args.join(' ');
       if (!text) {
-        await sendMessage(chatId, '✏️ */echo* needs some text.\n\nExample: `/echo hello world`');
+        await sendMessage(chatId, '✏️ *Echo needs some text.* Just say "echo hello" or "say hi" and I will repeat it back.');
         return;
       }
-      await sendMessage(chatId, `🔁 *You said:* ${text}`);
+      await sendMessage(chatId, `🔁 *Got it!* You said: *${text}* — I\'ll say it right back.`,
+        'Markdown');
     },
   },
   remind: {
     desc: 'Set a persistent reminder that pings you when the time comes.',
     handler: async (chatId, args) => {
       if (args.length < 2) {
-        await sendMessage(chatId, '⏰ */remind* needs a duration and a message.\n\nExample: `/remind 5m read email` or `/remind 1h team sync`');
+        await sendMessage(chatId, '⏰ *Reminder needs a time and a message.*\n\nTry: "remind me in 5m to read email" or "remind me to call mom"');
         return;
       }
       const duration = args[0];
       const message = args.slice(1).join(' ');
       const durationMs = parseDuration(duration);
       if (durationMs === null) {
-        await sendMessage(chatId, '⏰ Invalid duration. Use: `5m` (minutes), `1h` (hours), `30s` (seconds), `1d` (days).');
+        await sendMessage(chatId, '⏰ *Invalid time.* Use "5m" for minutes, "1h" for hours, "30s" for seconds, "1d" for days.');
         return;
       }
-      if (!env.REMINDERS) {
+      if (!BOT_ENV.REMINDERS) {
         await sendMessage(chatId, '⚠️ Reminder storage is not configured. Set a `REMINDERS` KV namespace and redeploy.');
         return;
       }
@@ -256,23 +268,24 @@ const COMMANDS = {
       };
       await storeEntry(entry);
       const mins = Math.round(durationMs / 60000);
-      await sendMessage(chatId, `⏰ *Reminder set:* ${duration} — *${message}*  (will ping you in ~${mins} min)`);
+      await sendMessage(chatId, `⏰ *Reminder set!* I\'ll ping you in ~${mins} min with: *${message}*`,
+        'Markdown');
     },
   },
   timer: {
     desc: 'Start a countdown timer (e.g. `/timer 10m` for 10 minutes).',
     handler: async (chatId, args) => {
       if (args.length < 1) {
-        await sendMessage(chatId, '⏱️ */timer* needs a duration.\n\nExample: `/timer 10m` (10 minutes) or `/timer 1h30m` (1 hour 30 minutes).');
+        await sendMessage(chatId, '⏱️ *Timer needs a duration.* Use: "set a 10 minute timer" or "countdown for 5 minutes"');
         return;
       }
       const duration = args.join(' ');
       const durationMs = parseDuration(duration);
       if (durationMs === null) {
-        await sendMessage(chatId, '⏱️ Invalid format. Use: `10m`, `1h30m`, `30s`, `1d`.');
+        await sendMessage(chatId, '⏱️ *Invalid duration.* Try: "10m", "1h30m", "30s", "1d"');
         return;
       }
-      if (!env.REMINDERS) {
+      if (!BOT_ENV.REMINDERS) {
         await sendMessage(chatId, '⚠️ Timer storage is not configured. Set a `REMINDERS` KV namespace and redeploy.');
         return;
       }
@@ -284,14 +297,15 @@ const COMMANDS = {
       };
       await storeEntry(entry);
       const mins = durationMs / 60000;
-      await sendMessage(chatId, `⏱️ *Timer started:* ${duration}. I will ping you when it finishes.`);
+      await sendMessage(chatId, `⏱️ *Timer started!* I\'ll ping you when ${mins} minutes are up.`,
+        'Markdown');
     },
   },
   alarm: {
     desc: 'Set an alarm (e.g. `/alarm 7am` for daily, `/alarm 7:30pm` for one-time).',
     handler: async (chatId, args) => {
       if (args.length < 1) {
-        await sendMessage(chatId, '🔔 */alarm* needs a time.\n\nUse: `/alarm 7am` (daily), `/alarm 7:30pm` (once today), `/alarm 14:00` (24h).');
+        await sendMessage(chatId, '🔔 *Alarm needs a time.* Try: "wake me up at 7am" or "set an alarm for 7:30pm"');
         return;
       }
       const timeStr = args.join(' ');
@@ -301,7 +315,7 @@ const COMMANDS = {
         // 12-hour format: "7am", "7:30pm", "7:00 AM", "7 PM"
         const match = timeStr.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
         if (!match) {
-          await sendMessage(chatId, '🔔 Invalid time format. Use: `7am`, `7:30pm`, `7:00 AM`, `7 PM`.');
+          await sendMessage(chatId, '🔔 *Invalid time format.* Use: "7am", "7:30pm", "7:00 AM", "7 PM"');
           return;
         }
         let hour = parseInt(match[1], 10);
@@ -320,13 +334,13 @@ const COMMANDS = {
         // 24-hour format: "14:00"
         const match = timeStr.match(/^(\d{1,2}):(\d{2})$/);
         if (!match) {
-          await sendMessage(chatId, '🔔 Invalid time format. Use: `14:00` (24h) or `7am`/`7:30pm` (AM/PM).');
+          await sendMessage(chatId, '🔔 *Invalid time.* Use: "14:00" (24h) or "7am"/"7:30pm" (AM/PM).');
           return;
         }
         const hour = parseInt(match[1], 10);
         const min = parseInt(match[2], 10);
         if (hour > 23 || min > 59) {
-          await sendMessage(chatId, '🔔 Invalid time. Use 00:00–23:59 in 24h format.');
+          await sendMessage(chatId, '🔔 *Invalid time.* Use 00:00–23:59 in 24h format.');
           return;
         }
         const today = new Date(now);
@@ -336,7 +350,7 @@ const COMMANDS = {
         }
         dueMs = today.getTime();
       }
-      if (!env.REMINDERS) {
+      if (!BOT_ENV.REMINDERS) {
         await sendMessage(chatId, '⚠️ Alarm storage is not configured. Set a `REMINDERS` KV namespace and redeploy.');
         return;
       }
@@ -351,13 +365,14 @@ const COMMANDS = {
       const ampm = hours >= 12 ? 'PM' : 'AM';
       const displayHours = hours % 12 || 12;
       const displayMin = String(new Date(dueMs).getMinutes()).padStart(2, '0');
-      await sendMessage(chatId, `🔔 *Alarm set:* ${displayHours}:${displayMin} ${ampm}. I will ping you.`);
+      await sendMessage(chatId, `🔔 *Alarm set!* I will wake you up at *${displayHours}:${displayMin} ${ampm}*.`,
+        'Markdown');
     },
   },
   whoami: {
     desc: 'Show your Telegram user ID.',
     handler: async (chatId, args) => {
-      await sendMessage(chatId, `👤 *Your user ID:* <code>${chatId}</code>`);
+      await sendMessage(chatId, `👤 *Your user ID:* <code>${chatId}</code> — I can ping you at this number!`);
     },
   },
   joke: {
@@ -365,12 +380,18 @@ const COMMANDS = {
     handler: async (chatId, args) => {
       const joke = await fetchJoke();
       if (!joke) {
-        await sendMessage(chatId, '😕 No joke available right now. Try again shortly.');
+        await sendMessage(chatId, '😕 Hmm, I couldn\'t find a joke right now. Try again in a moment!');
         return;
       }
       const setup = joke.setup || '';
       const punchline = joke.punchline || '';
-      await sendMessage(chatId, ['😂 *Joke*:', '', setup, '', `_${punchline}_`].join('\n'));
+      await sendMessage(chatId, [
+        '😂 *Here\'s a joke for you:*',
+        '',
+        setup,
+        '',
+        `_${punchline}_`,
+      ].join('\\n'));
     },
   },
   weather: {
@@ -378,27 +399,27 @@ const COMMANDS = {
     handler: async (chatId, args) => {
       const city = args.join(' ') || 'Berlin';
       if (!city) {
-        await sendMessage(chatId, '🌤️ */weather* needs a city name.\n\nExample: `/weather Tokyo`');
+        await sendMessage(chatId, '🌤️ *Weather needs a city.* Ask: "what\'s the weather in Tokyo" or "how\'s the weather in London"');
         return;
       }
       const summary = await fetchWeather(city);
       if (!summary) {
-        await sendMessage(chatId, `🌤️ Could not fetch weather for *${city}*. Try another city.`);
+        await sendMessage(chatId, `🌤️ Could not fetch weather for *${city}*. Try another city!`);
         return;
       }
-      await sendMessage(chatId, `🌤️ *${summary}*`);
+      await sendMessage(chatId, `🌤️ *Here\'s the weather in ${city}:* ${summary}`);
     },
   },
   chat: {
-    desc: 'Send a message to an AI (needs LLM_API_KEY env set).',
+    desc: 'Send a message to an AI.',
     handler: async (chatId, args) => {
       const prompt = args.join(' ');
       if (!prompt) {
-        await sendMessage(chatId, '💬 */chat* needs a message.\n\nExample: `/chat what is the capital of France?`');
+        await sendMessage(chatId, '💬 *Chat needs a message.* Try: "tell me a fact" or "ask me something"');
         return;
       }
       // Fallback if no LLM configured
-      await sendMessage(chatId, '🤖 AI is not configured. Set LLM_API_KEY env var, then redeploy.');
+      await sendMessage(chatId, '🤖 *AI is not configured yet.* Set LLM_API_KEY to talk to an AI model.');
     },
   },
 };
@@ -411,7 +432,93 @@ function parseCommand(text) {
   // Strip leading slash from command name
   const cmdName = command.replace(/^\//, '');
   const args = idx === -1 ? [] : trimmed.slice(idx + 1).split(/\s+/);
+
+  // Check natural language command (no / prefix)
+  if (!cmdName.startsWith('/') && cmdName.length <= 20) {
+    const natural = parseNaturalLanguage(trimmed);
+    if (natural) return natural;
+  }
+
   return { command: cmdName, args };
+}
+
+/**
+ * Parse natural language commands (no / prefix).
+ * Returns { command, args } or null if no match.
+ */
+function parseNaturalLanguage(text) {
+  const lower = text.toLowerCase();
+
+  // --- Joke ---
+  if (/^(tell me|say|make me|please|suggest) (a )?joke|something funny|make me laugh|are you funny/i.test(text)) {
+    return { command: 'joke', args: [] };
+  }
+
+  // --- Weather: "weather in <city>", "what's the weather in <city>", "how's the weather in <city>" ---
+  const weatherMatch = text.match(/^(?:what('|’)?s|what is|how('|’)?s|how is)? (?:the )?weather in (.+)/i);
+  if (weatherMatch) {
+    const city = weatherMatch[1].trim();
+    if (city) return { command: 'weather', args: [city] };
+  }
+
+  // --- Echo: "echo <text>", "say <text>", "repeat <text>" ---
+  const echoMatch = text.match(/^(?:echo|say|repeat) (.+)/i);
+  if (echoMatch) {
+    return { command: 'echo', args: [echoMatch[1].trim()] };
+  }
+
+  // --- Reminder: "remind me to <message>", "set a reminder to <message>", "remind me in <dur> to <message>" ---
+  const reminderMatch = text.match(/^(?:remind me|set (?:a )?reminder)(?:\s+to)?\s+(.+)/i);
+  if (reminderMatch) {
+    let message = reminderMatch[1].trim();
+    // Check for duration prefix: "in 5m", "after 5m", "in 5 minutes"
+    const durationMatch = message.match(/^(in|after)\s+(\d+\s*(?:m|ms|s|h|d|minutes?|hours?|seconds?|days?))\s+(.+)/i);
+    if (durationMatch) {
+      const duration = durationMatch[2];
+      const msg = durationMatch[3].trim();
+      return { command: 'remind', args: [duration, msg] };
+    }
+    // No duration: treat the whole message as the reminder text
+    return { command: 'remind', args: [message] };
+  }
+
+  // --- Timer: "set a timer for <dur>", "start a timer (for)? <dur>", "timer for <dur>" ---
+  const timerMatch = text.match(/^(?:set|start) (?:a )?timer(?: for)? (\d+\s*(?:m|ms|s|h|d|minutes?|hours?|seconds?|days?))/i);
+  if (timerMatch) {
+    const duration = timerMatch[1].trim();
+    return { command: 'timer', args: [duration] };
+  }
+  // Also: "timer for 5m", "countdown for 5m"
+  const timerMatch2 = text.match(/^(?:timer|countdown)(?: for)? (\d+\s*(?:m|ms|s|h|d|minutes?|hours?|seconds?|days?))/i);
+  if (timerMatch2) {
+    const duration = timerMatch2[1].trim();
+    return { command: 'timer', args: [duration] };
+  }
+
+  // --- Alarm: "set an alarm for <time>", "wake me up at <time>", "alarm at <time>" ---
+  const alarmMatch = text.match(/^(?:set (?:an )?alarm|wake me up)(?:\s+(?:at|for))?\s+(.+)/i);
+  if (alarmMatch) {
+    const time = alarmMatch[1].trim();
+    return { command: 'alarm', args: [time] };
+  }
+
+  // --- Chat: "chat with me", "ask me something", "tell me <something>" ---
+  if (/^chat with me|ask me (about|something)|tell me/i.test(text)) {
+    const message = text.replace(/^(?:chat with me|ask me (?:about|something)|tell me)/i, '').trim();
+    return { command: 'chat', args: [message] };
+  }
+
+  // --- Start: "hi", "hello", "hey" ---
+  if (/^(hi|hello|hey|start|hi there|hello there)/i.test(text)) {
+    return { command: 'start', args: [] };
+  }
+
+  // --- Help: "help", "what can you do", "show me commands" ---
+  if (/^(help|what can you do|what do you do|show me commands|how do you work)/i.test(text)) {
+    return { command: 'help', args: [] };
+  }
+
+  return null;
 }
 
 // ---------------------------------------------------------------------------
