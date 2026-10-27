@@ -4,14 +4,17 @@ main = "worker.js"
 compatibility_date = "2026-10-23"
 
 # --- Secrets (set via `npx wrangler secret put <NAME>`) ---
-# TELEGRAM_TOKEN      = "8882265865:AAHxPWYwxeZ3edCVpzquf6qwBHegJCvvkYY"
-# LLM_API_KEY         = "sk-..."  (optional, for /chat)
+# NEVER commit real values here.
+# TELEGRAM_TOKEN      = (set via wrangler secret put)
+# LLM_API_KEY         = (optional, for /chat)
 # LLM_MODEL_NAME      = "llama3.1:8b"  (optional)
+# CRON_SECRET         = (optional, protects the /check cron endpoint)
+# WEBHOOK_SECRET      = (optional, validates Telegram webhook source)
 
 # --- KV namespace (set via `npx wrangler kv namespace create REMINDERS`) ---
 [[kv_namespaces]]
 binding = "REMINDERS"
-id = "1f97d34bcaca4def921a4478867c79c5"
+id = "bd92c4ab0d044d2688bf1479e3655799"
 
 # --- Cron: run reminder check every minute --------------------------------
 # Format: crons = ["*/1 * * * *"] means run every minute
