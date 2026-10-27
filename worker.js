@@ -202,7 +202,7 @@ const COMMANDS = {
       await sendMessage(chatId, [
         '📖 *Telegram Secretary — Commands*',
         '',
-        '/*Slash commands*/',
+        '***Slash Commands****
         '/*start* */            Show this welcome message',
         '/*help* */             Show this list',
         '/*echo <text>* */       Repeat your text back',
@@ -411,15 +411,98 @@ const COMMANDS = {
     },
   },
   chat: {
-    desc: 'Send a message to an AI.',
+    desc: 'Send a message to an AI (OpenAI or OpenRouter API key required).',
     handler: async (chatId, args) => {
       const prompt = args.join(' ');
       if (!prompt) {
         await sendMessage(chatId, '💬 *Chat needs a message.* Try: "tell me a fact" or "ask me something"');
         return;
       }
-      // Fallback if no LLM configured
-      await sendMessage(chatId, '🤖 *AI is not configured yet.* Set LLM_API_KEY to talk to an AI model.');
+
+      // Configuration
+      const openaiKey = env.OPENAI_API_KEY;
+      const openrouterKey = env.OPENROUTER_API_KEY;
+      const ollamaBaseUrl = env.LLM_API_BASE_URL || 'http://localhost:11434';
+
+      // Determine provider
+      let baseUrl, apiKey, modelName, isOpenRouter;
+      if (openaiKey) {
+        baseUrl = 'https://api.openai.com/v1';
+        apiKey = openaiKey;
+        modelName = env.LLM_MODEL_NAME || 'gpt-4o-mini';
+        isOpenRouter = false;
+      } else if (openrouterKey) {
+        baseUrl = 'https://openrouter.ai/api/v1';
+        apiKey = openrouterKey;
+        modelName = env.LLM_MODEL_NAME || 'google/gemma-3-4b-it';
+        isOpenRouter = true;
+      } else {
+        // Try Ollama (local)
+        baseUrl = ollamaBaseUrl;
+        apiKey = null;
+        modelName = env.LLM_MODEL_NAME || 'llama3.1:8b';
+        isOpenRouter = false;
+      }
+
+      if (!apiKey && !ollamaBaseUrl) {
+        await sendMessage(chatId, '🤖 *AI not configured.* Set OPENAI_API_KEY, OPENROUTER_API_KEY, or LLM_API_BASE_URL env var.');
+        return;
+      }
+
+      // Build the request
+      let requestBody;
+      if (isOpenRouter) {
+        requestBody = {
+          model: modelName,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 500,
+          temperature: 0.7,
+        };
+      } else {
+        requestBody = {
+          model: modelName,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 500,
+          temperature: 0.7,
+        };
+      }
+
+      try {
+        const resp = await fetch(baseUrl + '/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+            'HTTP-Referer': 'https://telegram-secretary-bot.null-gui.workers.dev',
+            ...(isOpenRouter ? { 'X-Title': 'Telegram Secretary Bot' } : {}),
+          },
+          body: JSON.stringify(requestBody),
+        });
+
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          throw new Error(err.error?.message || `LLM API error: ${resp.status}`);
+        }
+
+        const data = await resp.json();
+
+        // Extract response text
+        const choice = data.choices?.[0];
+        const text = choice?.message?.content || data.text || 'I couldn\'t generate a response.';
+
+        // Clean up the response for Telegram
+        const cleanText = text.replace(/\n+/g, ' ').trim();
+
+        await sendMessage(chatId, [
+          '🤖 *AI says:*',
+          '',
+          cleanText,
+        ].join('\\n'));
+
+      } catch (err) {
+        console.error('Chat LLM error:', err);
+        await sendMessage(chatId, `🤖 *AI error:* ${err.message || 'Failed to get response. Check your API key and network.'}`);
+      }
     },
   },
 };
@@ -679,14 +762,15 @@ async function processUpdate(update) {
     return;
   }
 
-  // Default: echo-like reply.
+  // Default: natural echo-like reply.
   await sendMessage(chatId, [
     '📬 *Received:*',
     '',
     _escapeMarkdown(text),
     '',
-    'I am a Telegram Secretary running on Cloudflare Workers.',
-    'Try /help to see what I can do!',
+    'Got it! I'll keep that in mind.',
+    '',
+    'Type /help to see what I can do.',
   ].join('\n'), 'Markdown');
 }
 
