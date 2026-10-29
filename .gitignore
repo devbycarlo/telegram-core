@@ -18,3 +18,27 @@ build/
 
 # .pi models
 .pi/models.json
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Secrets and API keys
+secrets.json
+config.json
+credentials.json
+
+# Sensitive files
+*.pem
+*.key
+*.crt
+id_rsa
+id_rsa.pub
+*.pfx
+*.p12
+
+# Database backups
+*.sql
+*.bak
+*.db-journal
