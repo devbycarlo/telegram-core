@@ -520,27 +520,69 @@ def _cmd_delete(chat_id: int, args: list[str]) -> None:
 
 
 def reply_plain_text(chat_id: int, text: str) -> None:
-    """Forward a plain-text message through the local phi4-mini:3.8b model."""
-    try:
-        resp = requests.post(
-            "http://localhost:11434/v1/chat/completions",
-            json={
-                "model": "phi4-mini:3.8b",
-                "messages": [
-                    {"role": "system", "content": "You are a helpful, concise Telegram assistant. Keep answers short and actionable."},
-                    {"role": "user", "content": text},
-                ],
-                "temperature": 0.2,
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        reply = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-        send_message(chat_id, reply or "⚠️ I couldn't generate a reply.")
-    except Exception as e:
-        logger.error("Plain-text reply failed: %s", e)
-        send_message(chat_id, f"⚠️ Could not reach local model: {e}")
+    """Reply to free-form chat messages through the local AI model.
+
+    The reply is generated conversationally and lightly polished before it is
+    sent back to Telegram. If the model returns an empty or too-short answer
+    it is asked once more; on any persistent failure a friendly fallback is
+    sent instead of a raw error.
+    """
+    base_url = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
+    model = os.getenv("LLM_MODEL", "phi4-mini:3.8b")
+    temperature = float(os.getenv("LLM_TEMPERATURE", "0.7"))
+
+    system_prompt = """You are a friendly, conversational Telegram personal assistant. You answer like a helpful person texting: warm, natural, and concise. Never sound like a robot, a manual, or an AI.
+
+Rules:
+- Answer in full, natural sentences. No lists or bullets unless the answer is long or the user specifically asks for them.
+- Keep it short and match the length of the question.
+- Use a normal tone. Add an emoji only if it genuinely fits.
+- If you did not understand, ask one short, friendly clarifying question.
+- Never write "As an AI...", "I'm sorry", or repeat the user.
+"""
+
+    def extract_reply(data):
+        return ((data.get("choices") or [{}])[0].get("message", {}).get("content", "") or "").strip()
+
+    def polish(reply):
+        if not reply:
+            return ""
+        # Unwrap common markdown fencing the model may have added
+        if len(reply) > 6 and reply.startswith("```") and reply.endswith("```"):
+            reply = reply[3:-3].strip()
+        elif len(reply) >= 2 and reply.startswith("`") and reply.endswith("`"):
+            reply = reply[1:-1].strip()
+        return " ".join(reply.split())
+
+    last_error = None
+    for attempt in range(2):
+        user_content = text
+        if attempt == 1:
+            user_content = text + "\n\n(Reply with a single, clear, natural answer.)"
+        try:
+            resp = requests.post(
+                base_url + "/chat/completions",
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content},
+                    ],
+                    "temperature": temperature,
+                },
+                timeout=90,
+            )
+            resp.raise_for_status()
+            reply = polish(extract_reply(resp.json()))
+            if reply:
+                send_message(chat_id, reply)
+                return
+            last_error = "model returned an empty reply"
+        except Exception as e:
+            last_error = e
+            logger.error("Plain-text reply failed: %s", e)
+
+    send_message(chat_id, "Sorry, I wasn't able to reply just now — could you try rephrasing or ask again in a moment?")
 
 
 def _cmd_clear(chat_id: int) -> None:
