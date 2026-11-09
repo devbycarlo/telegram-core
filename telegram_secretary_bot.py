@@ -26,6 +26,7 @@ import time
 import uuid
 import datetime
 import re
+import random
 import logging
 import requests
 import aiohttp
@@ -100,6 +101,7 @@ def init_db() -> None:
             created_at  TEXT NOT NULL,
             due_at      TEXT,
             recurrence  TEXT NOT NULL DEFAULT 'none',   -- none | daily | weekly | monthly
+            kind        TEXT NOT NULL DEFAULT 'reminder',  -- reminder | timer | alarm
             status      TEXT NOT NULL DEFAULT 'pending' -- pending | sent | done
         )
         """
@@ -117,6 +119,7 @@ def add_reminder(
     content: str,
     due_at: Optional[str] = None,
     recurrence: str = "none",
+    kind: str = "reminder",
 ) -> str:
     """Insert a new reminder and return its ID. Supports one-time or recurring."""
     rid = str(uuid.uuid4())
@@ -125,10 +128,10 @@ def add_reminder(
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO reminders (id, user_id, content, created_at, due_at, recurrence, status)
-        VALUES (?, ?, ?, ?, ?, ?, 'pending')
+        INSERT INTO reminders (id, user_id, content, created_at, due_at, recurrence, kind, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
         """,
-        (rid, user_id, content.strip(), now, due_at, recurrence),
+        (rid, user_id, content.strip(), now, due_at, recurrence, kind),
     )
     conn.commit()
     conn.close()
@@ -220,31 +223,39 @@ def send_schedule(chat_id: int, entries: list[dict]) -> None:
 
 
 def send_help(chat_id: int) -> None:
-    """Send the help / command reference."""
-    text = """
-🤖 *Telegram Secretary* — commands
-
-*Add a reminder*
-  /add <text> [HH:MM]  – add reminder now; optional HH:MM = due time (24h)
-
-*View*
-  /list  – all pending reminders
-  /now   – due-today reminders
-  /schedule  – today's agenda (empty slots if none)
-
-*Manage*
-  /delete <id>  – delete a specific reminder (id shown in /list)
-  /clear         – remove everything
-
-*Misc*
-  /help  – this message
-
-*Examples*
-  /add finish report 17:30
-  /add buy groceries
-  /add call mom 09:15
-"""
-    send_message(chat_id, text, parse_mode="MarkdownV2")
+    """Welcome a user and list what the assistant can do (natural language)."""
+    lines = [
+        "👋 Hey there! Welcome to Telegram Secretary — I'm your friendly assistant.",
+        "",
+        "No / prefix needed — just chat with me in plain words:",
+        "",
+        "🗓️ Reminders",
+        "  Remind me to read email",
+        "  Remind me in 5 minutes to call mom",
+        "",
+        "⏱️ Timers & alarms",
+        "  Set a 10 minute timer",
+        "  Countdown for 5 minutes",
+        "  Wake me up at 7am",
+        "  Set an alarm for 7:30pm",
+        "",
+        "🌤️ Weather",
+        "  What's the weather in Tokyo?",
+        "  How's the weather in Paris?",
+        "",
+        "😂 Jokes & facts",
+        "  Tell me a joke",
+        "  Tell me a fact",
+        "",
+        "🔊 Echo",
+        "  Echo hello",
+        "",
+        "💬 Chat",
+        "  Just talk to me about anything — “How's the weather?” or “Tell me a joke.”",
+        "",
+        "Type /help anytime for the full command reference.",
+    ]
+    send_message(chat_id, "\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +278,7 @@ def scheduler_loop() -> None:
 
             # 1. One-off due reminders
             cur.execute(
-                """SELECT id, user_id, content, due_at
+                """SELECT id, user_id, content, due_at, kind
                    FROM reminders
                    WHERE status = 'pending'
                      AND due_at IS NOT NULL
@@ -315,13 +326,19 @@ def scheduler_loop() -> None:
                 rid = row["id"]
                 uid = row["user_id"]
                 content = row["content"]
+                kind = row["kind"] if row["kind"] in ("reminder", "timer", "alarm") else "reminder"
                 conn = sqlite3.connect(DB_PATH)
                 cur = conn.cursor()
                 cur.execute("UPDATE reminders SET status = 'done' WHERE id = ?", (rid,))
                 conn.commit()
                 conn.close()
                 try:
-                    send_message(uid, f"⏰ *Reminder:* {content}")
+                    if kind == "alarm":
+                        send_message(uid, f"🔔 *Alarm!* {content}")
+                    elif kind == "timer":
+                        send_message(uid, f"⏰ *Timer!* {content}")
+                    else:
+                        send_message(uid, f"⏰ *Reminder:* {content}")
                 except Exception as e:
                     logger.error("Failed to send one-off %s to %s: %s", rid, uid, e)
 
@@ -566,6 +583,301 @@ def _cmd_clear(chat_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Natural-language (no slash) features
+#   timers · alarms · weather · jokes · facts · echo · open chat
+# ---------------------------------------------------------------------------
+JOKES = [
+    "Why did the robot go to therapy? Because it had too many issues to debug!",
+    "What do you call a fake noodle? An impasta!",
+    "Why was the robot cold? It left the oven on!",
+    "What do you call a robot that sings? A robo-ho!",
+    "Why did the smartphone go to the doctor? It dropped a few pixels!",
+    "What do you call a snake that works in construction? A boa constructor!",
+    "Why did the coffee file a police report? It got mugged!",
+    "What do you call a fish with a bowtie? Sofishtication!",
+]
+
+FACTS = [
+    "Octopuses have three hearts.",
+    "A day on Venus is longer than a year on Venus.",
+    "Honey never spoils — archaeologists have found edible honey in ancient tombs.",
+    "The Eiffel Tower grows in summer, expanding by about 15 cm in the heat.",
+    "Bananas are berries; strawberries aren't.",
+    "There are more possible chess games than atoms in the observable universe.",
+    "Wombat poop is cube-shaped so it never rolls away.",
+    "A group of flamingos is called a flamboyance.",
+]
+
+WEATHER_CODES = {
+    0: "Clear sky",
+    1: "Mainly clear",
+    2: "Partly cloudy",
+    3: "Overcast",
+    45: "Foggy",
+    48: "Foggy (freezing)",
+    51: "Light drizzle",
+    53: "Drizzle",
+    55: "Heavy drizzle",
+    56: "Freezing drizzle",
+    57: "Freezing drizzle (freezing rain)",
+    61: "Light rain",
+    63: "Rain",
+    65: "Heavy rain",
+    66: "Freezing rain",
+    67: "Freezing rain (heavy)",
+    71: "Light snow",
+    73: "Snow",
+    75: "Heavy snow",
+    77: "Snow grains",
+    80: "Light rain showers",
+    81: "Rain showers",
+    82: "Heavy rain showers",
+    85: "Light snow showers",
+    86: "Snow showers",
+    95: "Thunderstorm",
+    96: "Thunderstorm (light hail)",
+    99: "Thunderstorm (heavy hail)",
+}
+
+
+def _random_choice(items):
+    return random.choice(items)
+
+
+def _is_joke_t(t):
+    return any(k in t for k in ("joke", "laugh", "funny", "humor"))
+
+
+def _is_fact_t(t):
+    return any(k in t for k in ("fact", "interesting", "did you know", "trivia"))
+
+
+def _is_weather_t(t):
+    return "weather" in t
+
+
+def _is_alarm_intent(t):
+    return "alarm" in t or "wake me up" in t or "wake up at" in t
+
+
+def _is_reminder(t):
+    return "remind" in t
+
+
+def _echo_rest(text):
+    return re.sub(r"^echo\b\s*", "", text, flags=re.IGNORECASE).strip()
+
+
+def _add_seconds(dt, secs):
+    return dt + datetime.timedelta(seconds=secs)
+
+
+def _extract_duration(text):
+    """Return (total_seconds, after_text) for '10 minutes', '5m', '30s', etc.
+    Returns None if no duration is found."""
+    t = text.lower()
+    patterns = [
+        (r"(\d+)\s*(?:h|hr|hrs|hour|hours)(?![a-z])", 3600),
+        (r"(\d+)\s*(?:m|min|mins|minute|minutes)(?![a-z])", 60),
+        (r"(\d+)\s*(?:s|sec|secs|second|seconds)(?![a-z])", 1),
+    ]
+    for pat, mult in patterns:
+        m = re.search(pat, t)
+        if m:
+            return int(m.group(1)) * mult, text[m.end():]
+    return None
+
+
+def _extract_alarm_time(text):
+    """Return an iso due time for 'at 7:30pm', 'for 7:30pm', 'wake me up at 7am'.
+    Returns None if no usable clock time is found."""
+    t = text.lower()
+    m = re.search(r"(?:at|for|by|upon)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", t)
+    if not m:
+        return None
+    if m.group(2) is None and m.group(3) is None:
+        return None
+    hour = int(m.group(1))
+    minute = int(m.group(2)) if m.group(2) else 0
+    ampm = m.group(3)
+    if ampm:
+        if ampm == "am" and hour == 12:
+            hour = 0
+        elif ampm == "pm" and hour != 12:
+            hour += 12
+    now = datetime.datetime.now()
+    due = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if due <= now:
+        due += datetime.timedelta(days=1)
+    return due.isoformat()
+
+
+def _extract_city(text):
+    m = re.search(r"(?:weather\s+(?:in|of|for)\s+)([A-Za-z][A-Za-z\- ]+?)(?=\s|$|[^A-Za-z])", text.lower())
+    if not m:
+        return None
+    return m.group(1).strip()
+
+
+def _cmd_echo(chat_id, text):
+    rest = re.sub(r"^echo\b\s*", "", text, flags=re.IGNORECASE).strip()
+    send_message(chat_id, rest if rest else "Echo? Tell me something to repeat.")
+
+
+def _cmd_reminder(chat_id, text):
+    t = text.lower().strip()
+    dur = _extract_duration(t)
+    if dur is not None:
+        secs, after = dur
+        due_at = _add_seconds(datetime.datetime.now(), secs).isoformat()
+        content = after.strip()
+        content = re.sub(r"^(in|at|for|to)\s+", "", content, flags=re.IGNORECASE).strip()
+        content = re.sub(r"^(remind me|please remind me|remember to)\s+", "", content, flags=re.IGNORECASE).strip()
+        if not content:
+            content = "a reminder"
+    else:
+        due_at = None
+        content = re.sub(r"^(remind me|please remind me|remember to)\s+", "", t, flags=re.IGNORECASE).strip()
+        content = re.sub(r"^(to|for)\s+", "", content, flags=re.IGNORECASE).strip()
+        if not content:
+            content = "a reminder"
+    add_reminder(chat_id, content, due_at)
+    send_message(chat_id, f"✅ Reminder set: {content}")
+
+
+def _cmd_timer(chat_id, text, secs, note):
+    due = _add_seconds(datetime.datetime.now(), secs).isoformat()
+    add_reminder(chat_id, f"⏱ Timer ({secs // 60} min)", due, kind="timer")
+    send_message(chat_id, f"🛟 Timer set for {secs // 60} minute(s) — I'll let you know when it's up.")
+
+
+def _cmd_alarm(chat_id, due_iso, text):
+    add_reminder(chat_id, f"⏰ Alarm: {text}", due_iso, kind="alarm")
+    send_message(chat_id, f"🔔 Alarm set for {_fmt_time(due_iso)} — I'll wake you up.")
+
+
+def _fmt_time(iso_str):
+    try:
+        return datetime.datetime.fromisoformat(iso_str).strftime("%H:%M")
+    except Exception:
+        return iso_str
+
+
+def _get_city_coords(city):
+    url = f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=en&format=json"
+    try:
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("results"):
+            return None
+        r = data["results"][0]
+        return r["latitude"], r["longitude"], r["name"]
+    except Exception as e:
+        logger.error("Weather geocoding failed for %r: %s", city, e)
+        return None
+
+
+def _weather_desc(code):
+    return WEATHER_CODES.get(code, "Unknown")
+
+
+def _send_weather(chat_id, city):
+    coords = _get_city_coords(city)
+    if not coords:
+        send_message(chat_id, f"Sorry, I couldn't find a weather forecast for “{city}”.")
+        return
+    lat, lon, resolved = coords
+    try:
+        resp = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current": "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()["current"]
+    except Exception as e:
+        logger.error("Weather forecast failed for %r: %s", city, e)
+        send_message(chat_id, "Sorry, I couldn't fetch the weather right now.")
+        return
+
+    code = data.get("weather_code")
+    temp = data.get("temperature_2m")
+    feel = data.get("apparent_temperature")
+    hum = data.get("relative_humidity_2m")
+    prec = data.get("precipitation")
+
+    parts = [f"☀️ {resolved}: {temp}°C"]
+    if feel is not None and feel != temp:
+        parts.append(f"feels like {feel}°C")
+    if hum is not None:
+        parts.append(f"humidity {hum}%")
+    if prec is not None and prec > 0:
+        parts.append(f"precipitation {prec} mm")
+    send_message(chat_id, " • ".join(parts) + " — " + _weather_desc(code))
+
+
+def _cmd_fact(chat_id):
+    send_message(chat_id, _random_choice(FACTS))
+
+
+def _cmd_joke(chat_id):
+    send_message(chat_id, _random_choice(JOKES))
+
+
+def _dispatch_nl(chat_id, text):
+    """Route a free-text (no slash) message to the right feature."""
+    t = text.lower().strip()
+
+    # Echo
+    if re.match(r"^echo\b", t):
+        _cmd_echo(chat_id, text)
+        return
+
+    # Jokes / facts
+    if _is_joke_t(t):
+        _cmd_joke(chat_id)
+        return
+    if _is_fact_t(t):
+        _cmd_fact(chat_id)
+        return
+
+    # Weather
+    if _is_weather_t(t):
+        city = _extract_city(text)
+        if city:
+            _send_weather(chat_id, city)
+        else:
+            send_message(chat_id, "I couldn't guess the place. Try “What's the weather in Paris?”")
+        return
+
+    # Alarms / wake-ups
+    alarm = _extract_alarm_time(text)
+    if alarm is not None and _is_alarm_intent(t):
+        _cmd_alarm(chat_id, alarm, text)
+        return
+
+    # Reminders
+    if _is_reminder(t):
+        _cmd_reminder(chat_id, text)
+        return
+
+    # Timers / countdowns
+    dur = _extract_duration(text)
+    if dur is not None:
+        secs, note = dur
+        _cmd_timer(chat_id, text, secs, note)
+        return
+
+    # Open chat -> local model
+    reply_plain_text(chat_id, text)
+
+
+# ---------------------------------------------------------------------------
 # Command handler
 # ---------------------------------------------------------------------------
 def handle_message(chat_id: int, text: str) -> None:
@@ -606,8 +918,8 @@ def handle_message(chat_id: int, text: str) -> None:
         _cmd_status(chat_id)
         return
 
-    # Plain text (non-command) -> ask local model for a reply
-    reply_plain_text(chat_id, text)
+    # Plain text (non-command) -> route to the natural-language feature
+    _dispatch_nl(chat_id, text)
 
 
 def _cmd_status(chat_id: int) -> None:
