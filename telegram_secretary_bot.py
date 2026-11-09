@@ -833,6 +833,11 @@ def _dispatch_nl(chat_id, text):
     """Route a free-text (no slash) message to the right feature."""
     t = text.lower().strip()
 
+    # Liveness check
+    if re.match(r"^(ping|pong)\s*$", t):
+        send_message(chat_id, "pong! 🎯 I'm alive and running — what can I do for you?")
+        return
+
     # Echo
     if re.match(r"^echo\b", t):
         _cmd_echo(chat_id, text)
