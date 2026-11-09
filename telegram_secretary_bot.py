@@ -251,11 +251,14 @@ def send_help(chat_id: int) -> None:
 # Background scheduler (fires due reminders)
 # ---------------------------------------------------------------------------
 def scheduler_loop() -> None:
-    """Poll every 30s: fire due-time reminders, watch for recurring ones."""
+    """Poll every 30s: fire due-time reminders, watch for recurring ones.
+    Timers are compared in the same local wall-clock time the reminder was
+    stored in, so the due_at strings and this cutoff are directly comparable.
+    """
     logger.info("Scheduler loop started (30s interval)")
     while True:
         try:
-            now = datetime.datetime.now(datetime.timezone.utc)
+            now = datetime.datetime.now()
             due_cutoff = now.isoformat()
 
             conn = sqlite3.connect(DB_PATH)
@@ -334,7 +337,11 @@ def get_recurrence_type(recurrence: str) -> str:
 
 
 def compute_next_due(due_at: str, recurrence: str) -> str:
-    """Calculate the next occurrence in UTC ISO-8601 format."""
+    """Calculate the next occurrence in local ISO-8601 format.
+
+    The result uses the same local wall-clock time the reminder was stored in,
+    so it is directly comparable with the due_at values in SQLite.
+    """
     dt = datetime.datetime.fromisoformat(due_at)
     now = datetime.datetime.now()
 
@@ -370,45 +377,7 @@ def compute_next_due(due_at: str, recurrence: str) -> str:
     return due_at
 
 
-# ---------------------------------------------------------------------------
-# Command handler
-# ---------------------------------------------------------------------------
-def handle_message(chat_id: int, text: str) -> None:
-    """Dispatch inbound /command text to the right handler."""
-    parts = text.strip().split()
-    cmd = parts[0].lower()
-    args = parts[1:]
 
-    if cmd in ("/start", "/help"):
-        send_help(chat_id)
-        return
-
-    if cmd == "/add":
-        _cmd_add(chat_id, args)
-        return
-
-    if cmd == "/list":
-        _cmd_list(chat_id)
-        return
-
-    if cmd == "/now":
-        _cmd_now(chat_id)
-        return
-
-    if cmd == "/schedule":
-        _cmd_schedule(chat_id)
-        return
-
-    if cmd == "/delete":
-        _cmd_delete(chat_id, args)
-        return
-
-    if cmd == "/clear":
-        _cmd_clear(chat_id)
-        return
-
-    # Unknown command
-    send_message(chat_id, "⚠️ Unknown command. Type /help for available commands.")
 
 
 def _cmd_add(chat_id: int, args: list[str]) -> None:
@@ -420,27 +389,25 @@ def _cmd_add(chat_id: int, args: list[str]) -> None:
     text = " ".join(args)
     due_str = None
 
-    # Look for trailing HH:MM pattern
-    if text.endswith("") or True:
-        # Try to extract a time token like 17:30 or 5:30 PM
-        import re
-        m = re.search(r"(\d{1,2}):(\d{2})\s*(AM|PM)?$", text, re.IGNORECASE)
-        if m:
-            hh = int(m.group(1))
-            mm = int(m.group(2))
-            ampm = m.group(3)
-            if ampm:
-                if ampm.upper() == "PM" and hh != 12:
-                    hh += 12
-                if ampm.upper() == "AM" and hh == 12:
-                    hh = 0
-            now = datetime.datetime.now()
-            due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-            if due <= now:
-                due = due + datetime.timedelta(days=1)
-            due_str = due.isoformat()
-            # Strip the time from the text
-            text = re.sub(r"\s*\d{1,2}:\d{2}\s*(AM|PM)?$", "", text, flags=re.IGNORECASE).strip()
+    # Look for a trailing HH:MM pattern (e.g. 17:30 or 5:30 PM)
+    import re
+    m = re.search(r"(\d{1,2}):(\d{2})\s*(AM|PM)?$", text, re.IGNORECASE)
+    if m:
+        hh = int(m.group(1))
+        mm = int(m.group(2))
+        ampm = m.group(3)
+        if ampm:
+            if ampm.upper() == "PM" and hh != 12:
+                hh += 12
+            if ampm.upper() == "AM" and hh == 12:
+                hh = 0
+        now = datetime.datetime.now()
+        due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if due <= now:
+            due = due + datetime.timedelta(days=1)
+        due_str = due.isoformat()
+        # Strip the time from the text
+        text = re.sub(r"\s*\d{1,2}:\d{2}\s*(AM|PM)?$", "", text, flags=re.IGNORECASE).strip()
 
     if not text:
         send_message(chat_id, "⚠️ No reminder text provided.")
@@ -471,13 +438,20 @@ def _cmd_list(chat_id: int) -> None:
 
 
 def _cmd_now(chat_id: int) -> None:
-    """Show reminders due today."""
+    """Show reminders due today (at or before now)."""
     now = datetime.datetime.now()
-    today_str = now.strftime("%Y-%m-%dT%H:%M")
-    # Get all pending reminders that are due at or before now (due today)
-    # We'll just fetch all pending and filter client-side
+    today_str = now.strftime("%Y-%m-%dT%H:%M:%S")
+    # Get pending reminders that are due today and at or before now.
+    # due_at and today_str are both naive local ISO-8601 with seconds, so the
+    # string comparison is exact (no seconds-less cutoff truncation).
+    today = now.strftime("%Y-%m-%d")
     all_rem = get_reminders(chat_id, status="pending")
-    due_now = [r for r in all_rem if r.get("due_at") and r["due_at"] <= today_str]
+    due_now = [
+        r for r in all_rem
+        if r.get("due_at")
+        and r["due_at"] <= today_str
+        and r["due_at"].startswith(today)
+    ]
 
     if not due_now:
         send_message(chat_id, "✅ No reminders due right now.")
