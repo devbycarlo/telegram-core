@@ -125,6 +125,20 @@ def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_conversations_user "
         "ON conversations (user_id, id DESC)"
     )
+    # Learned user profile: durable facts the bot extracts from your chat over
+    # time (name, reply style, recurring topics). Stored per-user.
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS profile (
+            user_id     INTEGER NOT NULL,
+            key         TEXT NOT NULL,
+            value       TEXT NOT NULL,
+            source      TEXT NOT NULL DEFAULT 'unknown',   -- learned | manual | default
+            updated_at  TEXT NOT NULL,
+            PRIMARY KEY (user_id, key)
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -238,6 +252,126 @@ def clear_conversation_memory(user_id: int) -> int:
     logger.info("Cleared %d conversation-history entries for user %s", count, user_id)
     return count
 
+
+# ---------------------------------------------------------------------------
+# Learned user profile (learns as you chat)
+# ---------------------------------------------------------------------------
+# Persistent, per-user facts the bot extracts over time and injects into every
+# prompt so replies feel personal: your name, preferred reply style, and the
+# topics you actually chat about (not just the last few turns).
+# ---------------------------------------------------------------------------
+import re as _re
+
+def get_profile(user_id: int) -> dict[str, dict]:
+    """Return the full profile for a user as {key: {value, source, updated_at}}."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT key, value, source, updated_at FROM profile WHERE user_id = ?",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return {row["key"]: {
+        "value": row["value"],
+        "source": row["source"],
+        "updated_at": row["updated_at"],
+    } for row in rows}
+
+
+def set_profile(user_id: int, key: str, value: str, source: str = "manual") -> None:
+    """Upsert a single profile fact. source is one of: learned, manual, default."""
+    conn = sqlite3.connect(DB_PATH)
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO profile (user_id, key, value, source, updated_at) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, "
+        "source = excluded.source, updated_at = excluded.updated_at",
+        (user_id, key, value, source, now),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_profile(user_id: int) -> int:
+    """Delete all profile facts for a user. Returns the count removed."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM profile WHERE user_id = ?", (user_id,))
+    conn.commit()
+    count = cur.rowcount
+    conn.close()
+    logger.info("Cleared %d profile fact(s) for user %s", count, user_id)
+    return count
+
+
+def get_profile_summary(user_id: int) -> str:
+    """Return a concise, LLM-ready summary of the learned profile (empty if none)."""
+    profile = get_profile(user_id)
+    if not profile:
+        return ""
+    lines = ["Learned profile (adapted over time from your chats):"]
+    for key in sorted(profile):
+        lines.append(f"- {key}: {profile[key]['value']}")
+    return "\n".join(lines)
+
+
+def extract_profile_facts(user_id: int, history: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Deterministically extract durable profile facts from recent conversation.
+
+    Purely heuristic (no LLM call) so it works instantly and offline.
+    Returns a list of (key, value) pairs found in the user's own messages:
+      - name:    user's name, if they stated it
+      - style:   preferred reply style (bullets, concise, friendly, short)
+      - topics:  top recurring topics
+    """
+    user_text = " ".join(content for role, content in history if role == "user")
+    user_text = _re.sub(r"\s+", " ", user_text).strip().lower()
+
+    found = []
+
+    # Name: "my name is X" / "call me X"
+    name = None
+    m = _re.search(r"my name is (\w+)", user_text)
+    if m:
+        name = m.group(1)
+        found.append(("name", name))
+    else:
+        m = _re.search(r"call me (\w+)", user_text)
+        if m:
+            name = m.group(1)
+            found.append(("name", name))
+
+    # Reply style
+    style_toks = []
+    if _re.search(r"bullet", user_text):
+        style_toks.append("bullets")
+    if _re.search(r"concise|short", user_text):
+        style_toks.append("concise")
+    if _re.search(r"friendly|casual|chatty", user_text):
+        style_toks.append("friendly")
+    if style_toks:
+        found.append(("style", ", ".join(style_toks)))
+    style_words = set(style_toks + ([name] if name else []))
+
+    # Recurring topics: top keywords (excluding stop words and style terms)
+    stop = {
+        "the", "a", "an", "and", "or", "is", "are", "was", "were", "be", "been",
+        "to", "for", "in", "on", "at", "of", "it", "its", "this", "that", "i",
+        "me", "my", "you", "your", "he", "she", "they", "we", "what", "when",
+        "where", "how", "why", "please", "can", "could", "would", "should",
+        "remind", "set", "tell", "give", "show", "now", "tomorrow", "today",
+        "also", "just", "really", "very", "about", "from", "name",
+    }
+    counts: dict[str, int] = {}
+    for w in _re.findall(r"[a-z']+", user_text):
+        if w in stop or len(w) <= 2 or w in style_words:
+            continue
+        counts[w] = counts.get(w, 0) + 1
+    if counts:
+        top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        found.append(("topics", " ".join(w for w, _ in top[:5])))
+
+    return found
 
 # ---------------------------------------------------------------------------
 # Telegram API helpers
@@ -678,6 +812,11 @@ def reply_plain_text(chat_id: int, text: str, user_id: Optional[int] = None) -> 
     prior = get_conversation_history(user_id, limit=6)
     prior = prior[:-1]
 
+    # Learn durable profile facts from recent conversation (deterministic,
+    # no extra LLM hop). Stored per-user and injected into the prompt below.
+    for key, value in extract_profile_facts(user_id, get_conversation_history(user_id, limit=6)):
+        set_profile(user_id, key, value, source="learned")
+
     base_url = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
     model = os.getenv("LLM_MODEL", "phi4-mini:3.8b")
     temperature = float(os.getenv("LLM_TEMPERATURE", "0.7"))
@@ -699,6 +838,11 @@ Rules:
 - If you did not understand, ask one short, friendly clarifying question.
 - Never write "As an AI...", "I'm sorry", or repeat the user.
 """
+
+    # Inject the learned profile so the model personalizes replies over time.
+    profile_summary = get_profile_summary(user_id)
+    if profile_summary:
+        system_prompt += "\n\n" + profile_summary
 
     def extract_reply(data):
         return ((data.get("choices") or [{}])[0].get("message", {}).get("content", "") or "").strip()
@@ -1217,6 +1361,14 @@ def handle_message(chat_id: int, text: str, user_id: Optional[int] = None) -> No
         _cmd_memory(chat_id, args)
         return
 
+    if cmd == "/profile":
+        _cmd_profile(chat_id)
+        return
+
+    if cmd == "/memorize":
+        _cmd_memorize(chat_id, args)
+        return
+
     # Plain text (non-command) -> route to the natural-language feature
     _dispatch_nl(chat_id, text, user_id)
 
@@ -1246,6 +1398,29 @@ def _cmd_memory(chat_id: int, args: Optional[list[str]] = None) -> None:
         ])))
         return
 
+    if args and args[0] == "profile":
+        if len(args) > 1 and args[1] == "clear":
+            n = clear_profile(chat_id)
+            send_message(chat_id, "\n".join(_response([
+                _section("MEMORY"),
+                _item(f"Cleared {n} learned profile fact(s).", level=1),
+            ])))
+            return
+        summary = get_profile_summary(chat_id)
+        if not summary:
+            send_message(chat_id, "\n".join(_response([
+                _section("MEMORY"),
+                _item("No learned profile yet.", level=1),
+                _item("Chat normally and I'll start learning your preferences.", level=1),
+            ])))
+        else:
+            lines = [_section("MEMORY / PROFILE")]
+            for line in summary.splitlines():
+                if line.startswith("- "):
+                    lines.append(_item(line[2:]))
+            send_message(chat_id, "\n".join(_response(lines)))
+        return
+
     history = get_conversation_history(chat_id, limit=8)
     if not history:
         send_message(chat_id, "\n".join(_response([
@@ -1261,6 +1436,70 @@ def _cmd_memory(chat_id: int, args: Optional[list[str]] = None) -> None:
         lines.append(_item(f"[{role}] {preview}..."))
     lines.append(_item(f"(Showing {len(history)} of your most recent turns.)", level=1))
     send_message(chat_id, "\n".join(_response(lines)))
+
+
+def _cmd_profile(chat_id: int) -> None:
+    """Show the learned profile facts (what the bot remembers about you)."""
+    summary = get_profile_summary(chat_id)
+    if not summary:
+        send_message(chat_id, "\n".join(_response([
+            _section("PROFILE"),
+            _item("Nothing learned yet.", level=1),
+            _item("Chat normally and I'll start remembering your preferences.", level=1),
+        ])))
+        return
+    lines = [_section("PROFILE")]
+    for line in summary.splitlines():
+        if line.startswith("- "):
+            lines.append(_item(line[2:]))
+    send_message(chat_id, "\n".join(_response(lines)))
+
+
+def _cmd_memorize(chat_id: int, args: list[str]) -> None:
+    """Set or remove a learned fact manually (/memorize key value, /memorize remove key)."""
+    if not args:
+        send_message(chat_id, "\n".join(_response([
+            _section("MEMORIZE"),
+            _item("Usage: /memorize <key> <value>", level=1),
+            _item("       /memorize remove <key>", level=1),
+        ])))
+        return
+
+    if args[0].lower() == "remove":
+        if len(args) < 2:
+            send_message(chat_id, "\n".join(_response([
+                _section("MEMORIZE"),
+                _item("Usage: /memorize remove <key>", level=1),
+            ])))
+            return
+        key = args[1]
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM profile WHERE user_id = ? AND key = ?", (chat_id, key))
+        conn.commit()
+        count = cur.rowcount
+        conn.close()
+        send_message(chat_id, "\n".join(_response([
+            _section("MEMORIZE"),
+            _item(f"Removed {key} ({count} fact(s) removed).", level=1),
+        ])))
+        return
+
+    if len(args) < 2:
+        send_message(chat_id, "\n".join(_response([
+            _section("MEMORIZE"),
+            _item("Usage: /memorize <key> <value>", level=1),
+            _item("Example: /memorize nickname Alice", level=1),
+        ])))
+        return
+
+    key = args[0]
+    value = " ".join(args[1:])
+    set_profile(chat_id, key, value, source="manual")
+    send_message(chat_id, "\n".join(_response([
+        _section("MEMORIZE"),
+        _item(f"Saved profile fact: **{key}** → {value}", level=1),
+    ])))
 
 
 # ---------------------------------------------------------------------------
