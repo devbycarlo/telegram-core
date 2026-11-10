@@ -620,11 +620,12 @@ def reply_plain_text(chat_id: int, text: str) -> None:
 
 RESPONSE OUTLINING PROTOCOL (INVARIANT):
 Every reply MUST start with "═══ RESPONSE ═══" and end with "═══ END ═══".
-Use numbered sections [1], [2], ... for each topic. Nest bullet items with
-exactly 3-space indentation + "•" marker. Use "↳" for supporting details at
-deeper indentation. If the user asks for a list or bullets, expand every item
-into its own line under the proper numbered section, adding sub-detail lines
-where useful.
+Use bold markdown headers (**Header**) for each category.
+Under each header, list individual items as bullet points (- item).
+Leave a blank line between each section for maximum readability.
+Keep bullets concise — one line each where possible.
+If the user asks for a list or bullets, expand every item into its own line
+under the proper section, adding sub-detail lines where useful.
 
 Rules:
 - Keep it short and match the length of the question.
