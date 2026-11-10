@@ -86,6 +86,36 @@ function parseDuration(str) {
   return val * (multipliers[unit] || 60000);
 }
 
+/** Parse a duration or relative-time token into milliseconds.
+ * Supports "5m", "1h30m", "30s", "1d", plus relative times "tomorrow", "next week", "next month". */
+function toDueMs(str, now = new Date()) {
+  if (!str) return null;
+  const rel = str.toLowerCase();
+  if (/^tomorrow$/i.test(rel)) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + 1);
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 0).getTime();
+  }
+  if (/^next week$/i.test(rel)) {
+    const d = new Date(now);
+    const days = (7 - d.getDay()) % 7 || 7; // next Monday
+    d.setDate(d.getDate() + days);
+    d.setHours(23, 59, 0, 0);
+    return d.getTime();
+  }
+  if (/^next month$/i.test(rel)) {
+    return new Date(now.getFullYear(), now.getMonth() + 1, 1, 0, 0, 0).getTime();
+  }
+  const match = str.match(/^(\d+)\s*(ms|m|h|s|d)?$/i);
+  if (match) {
+    const val = parseInt(match[1], 10);
+    const unit = (match[2] || 'm').toLowerCase();
+    const multipliers = { 'ms': 1, 's': 1000, 'm': 60000, 'h': 3600000, 'd': 86400000 };
+    return val * (multipliers[unit] || 60000);
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Reminder storage (KV)
 // ---------------------------------------------------------------------------
@@ -249,9 +279,9 @@ const COMMANDS = {
       }
       const duration = args[0];
       const message = args.slice(1).join(' ');
-      const durationMs = parseDuration(duration);
+      const durationMs = toDueMs(duration);
       if (durationMs === null) {
-        await sendMessage(env, chatId, '⏰ *Invalid time.* Use "5m" for minutes, "1h" for hours, "30s" for seconds, "1d" for days.');
+        await sendMessage(env, chatId, '⏰ *Invalid time.* Use "5m" for minutes, "1h" for hours, "30s" for seconds, "1d" for days, or "tomorrow", "next week".');
         return;
       }
       if (!env.REMINDERS) {
@@ -562,18 +592,28 @@ function parseNaturalLanguage(text) {
     return { command: 'echo', args: [echoMatch[1].trim()] };
   }
 
-  // --- Reminder: "remind me to <message>", "set a reminder to <message>", "remind me in <dur> to <message>" ---
-  const reminderMatch = text.match(/^(?:remind me|set (?:a )?reminder)(?:\s+to)?\s+(.+)/i);
+  // --- Reminder: "remind me to <message>", "set a reminder to <message>",
+  //    "can you remind me to <message>", "could you remind me to <message>",
+  //    "please remind me to <message>", "remind me in <dur> to <message>" ---
+  const reminderMatch = text.match(/^(?:set (?:a )?reminder|can you|could you|please|remind me)(?:\s+to)?\s+(.+)/i);
   if (reminderMatch) {
     let message = reminderMatch[1].trim();
-    // Check for duration prefix: "in 5m", "after 5m", "in 5 minutes"
-    const durationMatch = message.match(/^(in|after)\s+(\d+\s*(?:m|ms|s|h|d|minutes?|hours?|seconds?|days?))\s+(.+)/i);
-    if (durationMatch) {
-      const duration = durationMatch[2];
-      const msg = durationMatch[3].trim();
-      return { command: 'remind', args: [duration, msg] };
+    // Check for relative-time / duration prefix: "in 5m", "tomorrow", "next week", "after 5m"
+    const timeMatch = message.toLowerCase().match(/^(in|after|tomorrow|today|tonight|next week|next month)\s*(?:to)?\s*(.+)?/i);
+    if (timeMatch) {
+      const time = timeMatch[1];
+      const msg = timeMatch[3] ? timeMatch[3].trim() : '';
+      if (/^(tomorrow|today|tonight|next week|next month)$/i.test(time)) {
+        return { command: 'remind', args: [time, msg] };
+      }
+      if (time === 'in' || time === 'after') {
+        const duration = timeMatch[2];
+        if (duration) return { command: 'remind', args: [duration, msg] };
+      }
+      // e.g. "tomorrow to ...", "next week to ..."
+      return { command: 'remind', args: ['1d', msg] };
     }
-    // No duration: treat the whole message as the reminder text
+    // No time: treat the whole message as the reminder text
     return { command: 'remind', args: [message] };
   }
 
