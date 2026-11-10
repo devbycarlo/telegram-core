@@ -196,66 +196,114 @@ def _api(method: str, payload: dict) -> dict:
     return data
 
 
+# ---------------------------------------------------------------------------
+# Response formatting — hierarchical, list-organized, structurally constrained
+# Per user preference: bold headers for categories, '-' bullets for items,
+# blank line between each section.
+# ---------------------------------------------------------------------------
+ENVELOPE_START = "═══ RESPONSE ═══"
+ENVELOPE_END = "═══ END ═══"
+
+
+def _section(title: str) -> str:
+    """Open a category header: bold markdown bold (**Header**)."""
+    return f"**{title}**"
+
+
+def _item(text: str, level: int = 0) -> str:
+    """Emit a bullet list item at a given nesting level.
+
+    Rules: exactly 2 spaces per level, then dash + space.
+    """
+    indent = "  " * level
+    return f"{indent}- {text}"
+
+
+def _subitem(text: str, level: int = 0) -> str:
+    """Emit a sub-detail line under a bullet item.
+
+    Uses nested '-' at deeper indentation.
+    """
+    indent = "  " * (level + 1)
+    return f"{indent}- {text}"
+
+
+def _blank() -> str:
+    """Blank line between sections."""
+    return ""
+
+
+def _response(lines: list[str]) -> list[str]:
+    """Wrap a list of body lines in the standard response envelope.
+
+    The envelope is invariant: every bot reply must begin with
+    ENVELOPE_START and end with ENVELOPE_END.
+    """
+    return [ENVELOPE_START] + list(lines) + [ENVELOPE_END]
+
+
 def send_message(chat_id: int, text: str, parse_mode: str = "MarkdownV2") -> None:
     """Send a text message to a chat."""
     _api("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": parse_mode})
 
 
-def send_schedule(chat_id: int, entries: list[dict]) -> None:
-    """Send a formatted schedule/today-list message."""
-    if not entries:
-        send_message(chat_id, "📅 Your schedule is empty.")
-        return
-
-    lines = ["📅 Today's Schedule:", ""]
-    for entry in entries:
-        due = entry.get("due_at")
-        content = entry.get("content", "")
-        if due:
-            dt = datetime.datetime.fromisoformat(due)
-            rel = dt.strftime("%H:%M")
-            lines.append(f"• {content}  ({rel})")
-        else:
-            lines.append(f"• {content}")
-        lines.append("")
-
-    send_message(chat_id, "\n".join(lines).rstrip())
-
-
 def send_help(chat_id: int) -> None:
-    """Welcome a user and list what the assistant can do (natural language)."""
-    lines = [
-        "👋 Hey there! Welcome to Telegram Secretary — I'm your friendly assistant.",
-        "",
-        "No / prefix needed — just chat with me in plain words:",
-        "",
-        "🗓️ Reminders",
-        "  Remind me to read email",
-        "  Remind me in 5 minutes to call mom",
-        "",
-        "⏱️ Timers & alarms",
-        "  Set a 10 minute timer",
-        "  Countdown for 5 minutes",
-        "  Wake me up at 7am",
-        "  Set an alarm for 7:30pm",
-        "",
-        "🌤️ Weather",
-        "  What's the weather in Tokyo?",
-        "  How's the weather in Paris?",
-        "",
-        "😂 Jokes & facts",
-        "  Tell me a joke",
-        "  Tell me a fact",
-        "",
-        "🔊 Echo",
-        "  Echo hello",
-        "",
-        "💬 Chat",
-        "  Just talk to me about anything — “How's the weather?” or “Tell me a joke.”",
-        "",
-        "Type /help anytime for the full command reference.",
-    ]
-    send_message(chat_id, "\n".join(lines))
+    """Welcome a user and list what the assistant can do (hierarchical, outlaid)."""
+    response = []
+    response.append(_section("INTRODUCTION"))
+    response.append(_item("Say hello with /start, /help, or just type a plain message.", level=1))
+    response.append(_item("No / prefix needed for quick commands — chat naturally.", level=1))
+    response.append("")
+
+    response.append(_section("REMINDERS"))
+    response.append(_item("Remind me to read email", level=1))
+    response.append(_subitem("Natural-language add: “Remind me to read email”"))
+    response.append(_item("Remind me in 5 minutes to call mom", level=1))
+    response.append(_subitem("Timed reminder: “Remind me in 5 minutes to call mom”"))
+    response.append(_item("Use /add <text> [HH:MM] for a scheduled reminder", level=1))
+    response.append(_subitem("Example: /add call mom 17:30"))
+    response.append("")
+
+    response.append(_section("TIMERS & ALARMS"))
+    response.append(_item("Set a 10 minute timer", level=1))
+    response.append(_subitem("Duration-based count-down"))
+    response.append(_item("Countdown for 5 minutes", level=1))
+    response.append(_subitem("Alternative phrasing for timers"))
+    response.append(_item("Wake me up at 7am", level=1))
+    response.append(_subitem("Alarm with time-of-day"))
+    response.append(_item("Set an alarm for 7:30pm", level=1))
+    response.append(_subitem("Explicit alarm: “set an alarm for 7:30pm”"))
+    response.append("")
+
+    response.append(_section("WEATHER"))
+    response.append(_item("How's the weather in Paris?", level=1))
+    response.append(_subitem("Natural question with place name"))
+    response.append(_item("What's the weather in Tokyo?", level=1))
+    response.append(_subitem("Explicit weather query"))
+    response.append("")
+
+    response.append(_section("JOKES & FACTS"))
+    response.append(_item("Tell me a joke", level=1))
+    response.append(_subitem("Ask for a classic joke"))
+    response.append(_item("Tell me a fact", level=1))
+    response.append(_subitem("Ask for an interesting fact"))
+    response.append("")
+
+    response.append(_section("ECHO & CHAT"))
+    response.append(_item("Echo hello", level=1))
+    response.append(_subitem("Repeat your message back verbatim"))
+    response.append(_item("Just talk to me about anything", level=1))
+    response.append(_subitem("“How's the weather?” or “Tell me a joke.”"))
+    response.append("")
+
+    response.append(_section("SLASH COMMANDS"))
+    response.append(_item("Type /help anytime for the full command reference.", level=1))
+    response.append("")
+
+    response.append(_section("QUICK REFERENCE"))
+    response.append(_item("Type /status to see the bot status and active reminder count.", level=1))
+    response.append("")
+    send_message(chat_id, "\n".join(_response(response)))
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +365,10 @@ def scheduler_loop() -> None:
                 conn.commit()
                 conn.close()
                 try:
-                    send_message(uid, f"🔁 *Recurring reminder:* {content} (next: {next_due.split('T')[1]})")
+                    send_message(uid, "\n".join(_response([
+                        _section("RECURRING REMINDER"),
+                        _item(f"Recurring reminder: {content} (next: {next_due.split('T')[1]})", level=1),
+                    ])))
                 except Exception as e:
                     logger.error("Failed to send recurring %s to %s: %s", rid, uid, e)
 
@@ -333,12 +384,11 @@ def scheduler_loop() -> None:
                 conn.commit()
                 conn.close()
                 try:
-                    if kind == "alarm":
-                        send_message(uid, f"🔔 *Alarm!* {content}")
-                    elif kind == "timer":
-                        send_message(uid, f"⏰ *Timer!* {content}")
-                    else:
-                        send_message(uid, f"⏰ *Reminder:* {content}")
+                    icon = {"alarm": "🔔", "timer": "⏰", "reminder": "⏰"}.get(kind, "⏰")
+                    send_message(uid, "\n".join(_response([
+                        _section("REMINDER"),
+                        _item(f"{icon} {kind.capitalize()}! {content}", level=1),
+                    ])))
                 except Exception as e:
                     logger.error("Failed to send one-off %s to %s: %s", rid, uid, e)
 
@@ -400,7 +450,10 @@ def compute_next_due(due_at: str, recurrence: str) -> str:
 def _cmd_add(chat_id: int, args: list[str]) -> None:
     """Parse /add <text> [HH:MM] and store."""
     if not args:
-        send_message(chat_id, "Usage: /add <text> [HH:MM]")
+        send_message(chat_id, "\n".join(_response([
+            _section("ADD REMINDER"),
+            _item("Usage: /add <text> [HH:MM]", level=1),
+        ])))
         return
 
     text = " ".join(args)
@@ -427,31 +480,44 @@ def _cmd_add(chat_id: int, args: list[str]) -> None:
         text = re.sub(r"\s*\d{1,2}:\d{2}\s*(AM|PM)?$", "", text, flags=re.IGNORECASE).strip()
 
     if not text:
-        send_message(chat_id, "⚠️ No reminder text provided.")
+        send_message(chat_id, "\n".join(_response([
+            _section("ADD REMINDER"),
+            _item("⚠️ No reminder text provided.", level=1),
+        ])))
         return
 
     add_reminder(chat_id, text, due_str)
     if due_str:
-        send_message(chat_id, f"✅ Reminder added (due {due_str.split('T')[1]}): {text}")
+        send_message(chat_id, "\n".join(_response([
+            _section("ADD REMINDER"),
+            _item(f"✅ Reminder added (due {due_str.split('T')[1]}): {text}", level=1),
+        ])))
     else:
-        send_message(chat_id, f"✅ Reminder added: {text}")
+        send_message(chat_id, "\n".join(_response([
+            _section("ADD REMINDER"),
+            _item(f"✅ Reminder added: {text}", level=1),
+        ])))
 
 
 def _cmd_list(chat_id: int) -> None:
-    """Show all pending reminders for the user, each with an ID."""
+    """Show all pending reminders for the user, each with an ID (hierarchical)."""
     reminders = get_reminders(chat_id, status="pending")
     if not reminders:
-        send_message(chat_id, "📭 You have no pending reminders.")
+        send_message(chat_id, "\n".join(_response([
+            _section("PENDING REMINDERS"),
+            _item("You have no pending reminders.", level=1),
+        ])))
         return
 
-    lines = ["📋 Your reminders:", ""]
+    response = [
+        _section("PENDING REMINDERS"),
+    ]
     for r in reminders:
-        lines.append(f"`{r['id']}`  {r['content']}")
+        response.append(_item(f"`{r['id']}`  {r['content']}", level=1))
         if r.get("due_at"):
             dt = datetime.datetime.fromisoformat(r["due_at"])
-            lines[-1] += f"  (due {dt.strftime('%H:%M')})"
-        lines.append("")
-    send_message(chat_id, "\n".join(lines).rstrip())
+            response.append(_item(f"(due {dt.strftime('%H:%M')})", level=1))
+    send_message(chat_id, "\n".join(_response(response)))
 
 
 def _cmd_now(chat_id: int) -> None:
@@ -471,17 +537,19 @@ def _cmd_now(chat_id: int) -> None:
     ]
 
     if not due_now:
-        send_message(chat_id, "✅ No reminders due right now.")
+        send_message(chat_id, "\n".join(_response([
+            _section("DUE NOW"),
+            _item("No reminders due right now.", level=1),
+        ])))
         return
 
-    lines = ["🔔 Due now:", ""]
+    response = [_section("DUE NOW")]
     for r in due_now:
-        lines.append(f"`{r['id']}`  {r['content']}")
+        response.append(_item(f"`{r['id']}`  {r['content']}", level=1))
         if r.get("due_at"):
             dt = datetime.datetime.fromisoformat(r["due_at"])
-            lines[-1] += f"  (due {dt.strftime('%H:%M')})"
-        lines.append("")
-    send_message(chat_id, "\n".join(lines).rstrip())
+            response.append(_item(f"(due {dt.strftime('%H:%M')})", level=1))
+    send_message(chat_id, "\n".join(_response(response)))
 
 
 def _cmd_schedule(chat_id: int) -> None:
@@ -493,21 +561,47 @@ def _cmd_schedule(chat_id: int) -> None:
     today = now.strftime("%Y-%m-%d")
     today_rems = [r for r in all_rem if r.get("due_at") and r["due_at"].startswith(today)]
 
-    send_schedule(chat_id, today_rems)
+    if not today_rems:
+        send_message(chat_id, "\n".join(_response([
+            _section("TODAY'S SCHEDULE"),
+            _item("Your schedule is empty.", level=1),
+        ])))
+        return
+
+    response = [_section("TODAY'S SCHEDULE")]
+    for entry in today_rems:
+        due = entry.get("due_at")
+        content = entry.get("content", "")
+        if due:
+            dt = datetime.datetime.fromisoformat(due)
+            rel = dt.strftime("%H:%M")
+            response.append(_item(f"{content}  ({rel})", level=1))
+        else:
+            response.append(_item(content, level=1))
+    send_message(chat_id, "\n".join(_response(response)))
 
 
 def _cmd_delete(chat_id: int, args: list[str]) -> None:
-    """Delete a specific reminder by ID."""
+    """Delete a specific reminder by ID (hierarchical response)."""
     if not args:
-        send_message(chat_id, "Usage: /delete <reminder_id>")
+        send_message(chat_id, "\n".join(_response([
+            _section("DELETE REMINDER"),
+            _item("Usage: /delete <reminder_id>", level=1),
+        ])))
         return
 
     rid = args[0]
     deleted = delete_reminder(rid)
     if deleted:
-        send_message(chat_id, f"🗑️ Reminder `{rid}` deleted.")
+        send_message(chat_id, "\n".join(_response([
+            _section("DELETE REMINDER"),
+            _item(f"Reminder `{rid}` deleted.", level=1),
+        ])))
     else:
-        send_message(chat_id, f"⚠️ No reminder found with ID `{rid}`.")
+        send_message(chat_id, "\n".join(_response([
+            _section("DELETE REMINDER"),
+            _item(f"No reminder found with ID `{rid}`.", level=1),
+        ])))
 
 
 def reply_plain_text(chat_id: int, text: str) -> None:
@@ -522,10 +616,17 @@ def reply_plain_text(chat_id: int, text: str) -> None:
     model = os.getenv("LLM_MODEL", "phi4-mini:3.8b")
     temperature = float(os.getenv("LLM_TEMPERATURE", "0.7"))
 
-    system_prompt = """You are a friendly, conversational Telegram personal assistant. You answer like a helpful person texting: warm, natural, and concise. Never sound like a robot, a manual, or an AI.
+    system_prompt = """You are a friendly, conversational Telegram personal assistant.
+
+RESPONSE OUTLINING PROTOCOL (INVARIANT):
+Every reply MUST start with "═══ RESPONSE ═══" and end with "═══ END ═══".
+Use numbered sections [1], [2], ... for each topic. Nest bullet items with
+exactly 3-space indentation + "•" marker. Use "↳" for supporting details at
+deeper indentation. If the user asks for a list or bullets, expand every item
+into its own line under the proper numbered section, adding sub-detail lines
+where useful.
 
 Rules:
-- Answer in full, natural sentences. No lists or bullets unless the answer is long or the user specifically asks for them.
 - Keep it short and match the length of the question.
 - Use a normal tone. Add an emoji only if it genuinely fits.
 - If you did not understand, ask one short, friendly clarifying question.
@@ -543,7 +644,9 @@ Rules:
             reply = reply[3:-3].strip()
         elif len(reply) >= 2 and reply.startswith("`") and reply.endswith("`"):
             reply = reply[1:-1].strip()
-        return " ".join(reply.split())
+        # Collapse internal whitespace but preserve line breaks so hierarchy
+        # (indentation, numbered sections, sub-details) is not destroyed.
+        return "\n".join(" ".join(line.split()) for line in reply.splitlines())
 
     last_error = None
     for attempt in range(2):
@@ -577,9 +680,12 @@ Rules:
 
 
 def _cmd_clear(chat_id: int) -> None:
-    """Clear all user's reminders."""
+    """Clear all user's reminders (hierarchical response)."""
     count = clear_all_reminders(chat_id)
-    send_message(chat_id, f"🧹 Cleared {count} reminder(s).")
+    send_message(chat_id, "\n".join(_response([
+        _section("CLEAR"),
+        _item(f"Cleared {count} reminder(s).", level=1),
+    ])))
 
 
 # ---------------------------------------------------------------------------
@@ -721,7 +827,16 @@ def _extract_city(text):
 
 def _cmd_echo(chat_id, text):
     rest = re.sub(r"^echo\b\s*", "", text, flags=re.IGNORECASE).strip()
-    send_message(chat_id, rest if rest else "Echo? Tell me something to repeat.")
+    if rest:
+        send_message(chat_id, "\n".join(_response([
+            _section("ECHO"),
+            _item(rest, level=1),
+        ])))
+    else:
+        send_message(chat_id, "\n".join(_response([
+            _section("ECHO"),
+            _item("Echo? Tell me something to repeat.", level=1),
+        ])))
 
 
 def _cmd_reminder(chat_id, text):
@@ -742,18 +857,27 @@ def _cmd_reminder(chat_id, text):
         if not content:
             content = "a reminder"
     add_reminder(chat_id, content, due_at)
-    send_message(chat_id, f"✅ Reminder set: {content}")
+    send_message(chat_id, "\n".join(_response([
+        _section("REMINDER"),
+        _item(f"Reminder set: {content}", level=1),
+    ])))
 
 
 def _cmd_timer(chat_id, text, secs, note):
     due = _add_seconds(datetime.datetime.now(), secs).isoformat()
     add_reminder(chat_id, f"⏱ Timer ({secs // 60} min)", due, kind="timer")
-    send_message(chat_id, f"🛟 Timer set for {secs // 60} minute(s) — I'll let you know when it's up.")
+    send_message(chat_id, "\n".join(_response([
+        _section("TIMER"),
+        _item(f"Timer set for {secs // 60} minute(s) — I'll let you know when it's up.", level=1),
+    ])))
 
 
 def _cmd_alarm(chat_id, due_iso, text):
     add_reminder(chat_id, f"⏰ Alarm: {text}", due_iso, kind="alarm")
-    send_message(chat_id, f"🔔 Alarm set for {_fmt_time(due_iso)} — I'll wake you up.")
+    send_message(chat_id, "\n".join(_response([
+        _section("ALARM"),
+        _item(f"Alarm set for {_fmt_time(due_iso)} — I'll wake you up.", level=1),
+    ])))
 
 
 def _fmt_time(iso_str):
@@ -785,7 +909,10 @@ def _weather_desc(code):
 def _send_weather(chat_id, city):
     coords = _get_city_coords(city)
     if not coords:
-        send_message(chat_id, f"Sorry, I couldn't find a weather forecast for “{city}”.")
+        send_message(chat_id, "\n".join(_response([
+            _section("WEATHER"),
+            _item(f"Sorry, I couldn't find a weather forecast for “{city}.”", level=1),
+        ])))
         return
     lat, lon, resolved = coords
     try:
@@ -802,7 +929,10 @@ def _send_weather(chat_id, city):
         data = resp.json()["current"]
     except Exception as e:
         logger.error("Weather forecast failed for %r: %s", city, e)
-        send_message(chat_id, "Sorry, I couldn't fetch the weather right now.")
+        send_message(chat_id, "\n".join(_response([
+            _section("WEATHER"),
+            _item("Sorry, I couldn't fetch the weather right now.", level=1),
+        ])))
         return
 
     code = data.get("weather_code")
@@ -818,15 +948,24 @@ def _send_weather(chat_id, city):
         parts.append(f"humidity {hum}%")
     if prec is not None and prec > 0:
         parts.append(f"precipitation {prec} mm")
-    send_message(chat_id, " • ".join(parts) + " — " + _weather_desc(code))
+    send_message(chat_id, "\n".join(_response([
+        _section("WEATHER"),
+        _item(" • ".join(parts) + " — " + _weather_desc(code), level=1),
+    ])))
 
 
 def _cmd_fact(chat_id):
-    send_message(chat_id, _random_choice(FACTS))
+    send_message(chat_id, "\n".join(_response([
+        _section("FACT"),
+        _item(_random_choice(FACTS), level=1),
+    ])))
 
 
 def _cmd_joke(chat_id):
-    send_message(chat_id, _random_choice(JOKES))
+    send_message(chat_id, "\n".join(_response([
+        _section("JOKE"),
+        _item(_random_choice(JOKES), level=1),
+    ])))
 
 
 def _dispatch_nl(chat_id, text):
@@ -835,7 +974,10 @@ def _dispatch_nl(chat_id, text):
 
     # Liveness check
     if re.match(r"^(ping|pong)\s*$", t):
-        send_message(chat_id, "pong! 🎯 I'm alive and running — what can I do for you?")
+        send_message(chat_id, "\n".join(_response([
+            _section("LIVENESS"),
+            _item("pong! 🎯 I'm alive and running — what can I do for you?", level=1),
+        ])))
         return
 
     # Echo
@@ -857,7 +999,10 @@ def _dispatch_nl(chat_id, text):
         if city:
             _send_weather(chat_id, city)
         else:
-            send_message(chat_id, "I couldn't guess the place. Try “What's the weather in Paris?”")
+            send_message(chat_id, "\n".join(_response([
+                _section("WEATHER"),
+                _item("I couldn't guess the place. Try “What's the weather in Paris?”", level=1),
+            ])))
         return
 
     # Alarms / wake-ups
