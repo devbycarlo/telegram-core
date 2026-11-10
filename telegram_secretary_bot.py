@@ -110,6 +110,21 @@ def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_reminders_user_due "
         "ON reminders (user_id, due_at, recurrence)"
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS conversations (
+            user_id     INTEGER NOT NULL,
+            role        TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+            content     TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            id          INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT
+        )
+        """
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conversations_user "
+        "ON conversations (user_id, id DESC)"
+    )
     conn.commit()
     conn.close()
 
@@ -180,6 +195,47 @@ def clear_all_reminders(user_id: int) -> int:
     count = cur.rowcount
     conn.close()
     logger.info("Cleared %d reminders for user %s", count, user_id)
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Chat-memory / conversation history
+# ---------------------------------------------------------------------------
+def record_conversation(user_id: int, role: str, content: str) -> None:
+    """Persist one message (user or assistant) to the user's conversation memory."""
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO conversations (user_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, role, content, now),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_conversation_history(user_id: int, limit: int = 6) -> list[tuple[str, str]]:
+    """Return the most recent (role, content) pairs for a user, oldest-first."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT role, content FROM conversations WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+        (user_id, limit),
+    ).fetchall()
+    conn.close()
+    items = [(row["role"], row["content"]) for row in rows]
+    items.reverse()  # newest limit items -> chronological
+    return items
+
+
+def clear_conversation_memory(user_id: int) -> int:
+    """Delete all stored conversation history for a user. Returns the count removed."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM conversations WHERE user_id = ?", (user_id,))
+    conn.commit()
+    count = cur.rowcount
+    conn.close()
+    logger.info("Cleared %d conversation-history entries for user %s", count, user_id)
     return count
 
 
@@ -604,7 +660,7 @@ def _cmd_delete(chat_id: int, args: list[str]) -> None:
         ])))
 
 
-def reply_plain_text(chat_id: int, text: str) -> None:
+def reply_plain_text(chat_id: int, text: str, user_id: Optional[int] = None) -> None:
     """Reply to free-form chat messages through the local AI model.
 
     The reply is generated conversationally and lightly polished before it is
@@ -612,6 +668,16 @@ def reply_plain_text(chat_id: int, text: str) -> None:
     it is asked once more; on any persistent failure a friendly fallback is
     sent instead of a raw error.
     """
+    # Resolve the user so conversation memory is scoped per Telegram user.
+    if user_id is None:
+        user_id = chat_id
+    record_conversation(user_id, "user", text)
+
+    # Prior turns (oldest-first). Drop the just-recorded current message so the
+    # model sees the right context without duplicating it.
+    prior = get_conversation_history(user_id, limit=6)
+    prior = prior[:-1]
+
     base_url = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
     model = os.getenv("LLM_MODEL", "phi4-mini:3.8b")
     temperature = float(os.getenv("LLM_TEMPERATURE", "0.7"))
@@ -661,8 +727,9 @@ Rules:
                     "model": model,
                     "messages": [
                         {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_content},
-                    ],
+                    ]
+                    + [{"role": role, "content": content} for role, content in prior]
+                    + [{"role": "user", "content": user_content}],
                     "temperature": temperature,
                 },
                 timeout=90,
@@ -671,6 +738,7 @@ Rules:
             reply = polish(extract_reply(resp.json()))
             if reply:
                 send_message(chat_id, reply)
+                record_conversation(user_id, "assistant", reply)
                 return
             last_error = "model returned an empty reply"
         except Exception as e:
@@ -840,28 +908,99 @@ def _cmd_echo(chat_id, text):
         ])))
 
 
+def _floor_time(dt: datetime.datetime) -> datetime.datetime:
+    """Truncate seconds/microseconds for a clean reminder due time."""
+    return dt.replace(second=0, microsecond=0)
+
+
+def _extract_reminder_time(text: str) -> Optional[str]:
+    """Return an ISO-8601 due datetime for relative-time words, or None.
+
+    Supports day-level words (tomorrow, today, tonight, next week/month/year)
+    and numeric units (N minutes/hours/days). Normalizes common misspellings
+    of "tomorrow" (e.g. "tommorow") to "tomorrow".
+    """
+    t = re.sub(r"tommorow|tomarrow|tmmrw", "tomorrow", text, flags=re.IGNORECASE)
+    t_lower = t.lower()
+
+    now = datetime.datetime.now()
+
+    # Day-level relative words.
+    if re.search(r"\b(?:tmr|day after tomorrow)\b", t_lower):
+        return _floor_time(now + datetime.timedelta(days=1)).isoformat()
+    if re.search(r"\b(?:tomorrow|day after tomorrow)\b", t_lower):
+        return _floor_time(now + datetime.timedelta(days=1)).isoformat()
+    if re.search(r"\b(?:today|tonight|this evening)\b", t_lower):
+        due = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        if due <= now:
+            due += datetime.timedelta(days=1)
+        return due.isoformat()
+    if re.search(r"\b(?:next week)\b", t_lower):
+        days_ahead = (7 - now.weekday()) % 7 or 7  # next Monday
+        return _floor_time(now + datetime.timedelta(days=days_ahead)).isoformat()
+    if re.search(r"\b(?:next month)\b", t_lower):
+        if now.month == 12:
+            next_month, next_year = 1, now.year + 1
+        else:
+            next_month, next_year = now.month + 1, now.year
+        day = min(now.day, 28)
+        due = datetime.datetime(next_year, next_month, day,
+                                now.hour, now.minute, second=0, microsecond=0)
+        if due <= now:
+            due += datetime.timedelta(days=1)
+        return due.isoformat()
+    if re.search(r"\b(?:next year)\b", t_lower):
+        due = datetime.datetime(now.year + 1, now.month, min(now.day, 28),
+                                now.hour, now.minute, second=0, microsecond=0)
+        if due <= now:
+            due += datetime.timedelta(days=1)
+        return due.isoformat()
+
+    # Numeric units (minutes / hours / days).
+    m = re.search(r"\b(\d+)\s*(minutes?|mins?|hours?|hrs?|days?|seconds?|secs?)\b", t_lower)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        mult = {"minutes": 60, "mins": 60, "hours": 3600, "hrs": 3600,
+                "days": 86400, "seconds": 1, "secs": 1}[unit]
+        return _floor_time(now + datetime.timedelta(seconds=n * mult)).isoformat()
+
+    return None
+
+
 def _cmd_reminder(chat_id, text):
-    t = text.lower().strip()
-    dur = _extract_duration(t)
-    if dur is not None:
-        secs, after = dur
-        due_at = _add_seconds(datetime.datetime.now(), secs).isoformat()
-        content = after.strip()
-        content = re.sub(r"^(in|at|for|to)\s+", "", content, flags=re.IGNORECASE).strip()
-        content = re.sub(r"^(remind me|please remind me|remember to)\s+", "", content, flags=re.IGNORECASE).strip()
-        if not content:
-            content = "a reminder"
+    # Normalize misspellings so "tommorow" behaves as "tomorrow".
+    t = re.sub(r"tommorow|tomarrow|tmmrw", "tomorrow", text.lower().strip(), flags=re.IGNORECASE)
+    due_at = _extract_reminder_time(t)
+
+    # Extract the reminder content by dropping time words and boilerplate.
+    content = t
+    content = re.sub(r"\b(tomorrow|tmr|today|tonight|this evening|day after tomorrow|next week|next month|next year)\b", " ", content, flags=re.IGNORECASE)
+    content = re.sub(r"^(can you|could you|please|please remind me|remember to)\s+", "", content, flags=re.IGNORECASE)
+    content = re.sub(r"\s+", " ", content).strip().rstrip(".,!?;:").strip()
+    if not content:
+        content = "a reminder"
+
+    if due_at is not None:
+        add_reminder(chat_id, content, due_at)
+        # Natural confirmation for a yes/no question with no explicit item.
+        if re.search(r"\b(can you|could you|would you|please)\b", text.lower()) and content == "remind me":
+            send_message(chat_id, "\n".join(_response([
+                _section("REMINDER"),
+                _item("Sure — I'll remind you tomorrow.", level=1),
+            ])))
+        else:
+            send_message(chat_id, "\n".join(_response([
+                _section("REMINDER"),
+                _item(f"Reminder set: {content}", level=1),
+            ])))
     else:
-        due_at = None
-        content = re.sub(r"^(remind me|please remind me|remember to)\s+", "", t, flags=re.IGNORECASE).strip()
-        content = re.sub(r"^(to|for)\s+", "", content, flags=re.IGNORECASE).strip()
         if not content:
             content = "a reminder"
-    add_reminder(chat_id, content, due_at)
-    send_message(chat_id, "\n".join(_response([
-        _section("REMINDER"),
-        _item(f"Reminder set: {content}", level=1),
-    ])))
+        send_message(chat_id, "\n".join(_response([
+            _section("REMINDER"),
+            _item(f"No due time found for '{content}' — tell me when to remind you.", level=1),
+        ])))
 
 
 def _cmd_timer(chat_id, text, secs, note):
@@ -969,9 +1108,11 @@ def _cmd_joke(chat_id):
     ])))
 
 
-def _dispatch_nl(chat_id, text):
+def _dispatch_nl(chat_id, text, user_id: Optional[int] = None):
     """Route a free-text (no slash) message to the right feature."""
     t = text.lower().strip()
+    if user_id is None:
+        user_id = chat_id
 
     # Liveness check
     if re.match(r"^(ping|pong)\s*$", t):
@@ -1025,17 +1166,20 @@ def _dispatch_nl(chat_id, text):
         return
 
     # Open chat -> local model
-    reply_plain_text(chat_id, text)
+    reply_plain_text(chat_id, text, user_id)
 
 
 # ---------------------------------------------------------------------------
 # Command handler
 # ---------------------------------------------------------------------------
-def handle_message(chat_id: int, text: str) -> None:
+def handle_message(chat_id: int, text: str, user_id: Optional[int] = None) -> None:
     """Dispatch inbound message text to the right handler."""
     parts = text.strip().split()
     cmd = parts[0].lower()
     args = parts[1:]
+
+    if user_id is None:
+        user_id = chat_id
 
     if cmd in ("/start", "/help"):
         send_help(chat_id)
@@ -1069,23 +1213,54 @@ def handle_message(chat_id: int, text: str) -> None:
         _cmd_status(chat_id)
         return
 
+    if cmd == "/memory":
+        _cmd_memory(chat_id, args)
+        return
+
     # Plain text (non-command) -> route to the natural-language feature
-    _dispatch_nl(chat_id, text)
+    _dispatch_nl(chat_id, text, user_id)
 
 
 def _cmd_status(chat_id: int) -> None:
     """Show bot status and active reminder count."""
     count = len(get_reminders(chat_id, status="pending"))
-    text = f"🔧 *Bot Status*\n\n"
+    text = f"🔧 **Bot Status**\n\n"
     text += f"User ID: `{chat_id}`\n"
     text += f"Pending reminders: `{count}`\n"
     text += f"Database: `{DB_PATH.name}`\n"
     if USE_WEBHOOK:
-        text += f"Mode: *webhook* (port {WEBHOOK_PORT})\n"
+        text += f"Mode: **webhook** (port {WEBHOOK_PORT})\n"
         text += f"Endpoint: `{WEBHOOK_URL}`\n"
     else:
-        text += f"Mode: *long-polling*\n"
+        text += f"Mode: **long-polling**\n"
     send_message(chat_id, text, parse_mode="MarkdownV2")
+
+
+def _cmd_memory(chat_id: int, args: Optional[list[str]] = None) -> None:
+    """Show or clear the user's stored conversation history (/memory, /memory clear)."""
+    if args and args[0] == "clear":
+        count = clear_conversation_memory(chat_id)
+        send_message(chat_id, "\n".join(_response([
+            _section("MEMORY"),
+            _item(f"Cleared {count} stored conversation entry(ies).", level=1),
+        ])))
+        return
+
+    history = get_conversation_history(chat_id, limit=8)
+    if not history:
+        send_message(chat_id, "\n".join(_response([
+            _section("MEMORY"),
+            _item("No conversation history stored for you yet.", level=1),
+            _item("Messages are saved as you chat; use /memory clear to wipe them.", level=1),
+        ])))
+        return
+
+    lines = [_section("MEMORY")]
+    for role, content in history:
+        preview = content[:70].replace("\n", " ")
+        lines.append(_item(f"[{role}] {preview}..."))
+    lines.append(_item(f"(Showing {len(history)} of your most recent turns.)", level=1))
+    send_message(chat_id, "\n".join(_response(lines)))
 
 
 # ---------------------------------------------------------------------------
@@ -1115,7 +1290,8 @@ def run_bot() -> None:
                 chat_id = msg.get("chat", {}).get("id")
                 text = msg.get("text", "").strip()
                 if chat_id and text:
-                    handle_message(chat_id, text)
+                    from_id = msg.get("from", {}).get("id")
+                    handle_message(chat_id, text, user_id=from_id)
         except Exception as e:
             logger.error("Polling error: %s", e)
             time.sleep(5)
