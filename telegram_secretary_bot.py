@@ -376,14 +376,31 @@ def extract_profile_facts(user_id: int, history: list[tuple[str, str]]) -> list[
 # ---------------------------------------------------------------------------
 # Telegram API helpers
 # ---------------------------------------------------------------------------
-def _api(method: str, payload: dict) -> dict:
+BOT_USERNAME = None
+
+
+def _api(method: str, payload: dict, timeout: int = 35) -> dict:
     """Make a Telegram Bot API request. Raises on error."""
-    resp = requests.post(f"{BASE_URL}/{method}", json=payload, timeout=30)
+    resp = requests.post(f"{BASE_URL}/{method}", json=payload, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
     if not data.get("ok"):
         raise RuntimeError(f"Telegram API error {data.get('error_code')}: {data.get('description')}")
     return data
+
+
+def get_bot_username() -> Optional[str]:
+    """Return cached bot username (without @), fetching from Telegram if needed."""
+    global BOT_USERNAME
+    if BOT_USERNAME:
+        return BOT_USERNAME
+    try:
+        data = _api("getMe", {}, timeout=15)
+        BOT_USERNAME = (data.get("result") or {}).get("username")
+    except Exception as e:
+        logger.error("Failed to fetch bot username via getMe: %s", e)
+        BOT_USERNAME = None
+    return BOT_USERNAME
 
 
 # ---------------------------------------------------------------------------
@@ -424,17 +441,28 @@ def _blank() -> str:
 
 
 def _response(lines: list[str]) -> list[str]:
-    """Wrap a list of body lines in the standard response envelope.
-
-    The envelope is invariant: every bot reply must begin with
-    ENVELOPE_START and end with ENVELOPE_END.
-    """
-    return [ENVELOPE_START] + list(lines) + [ENVELOPE_END]
+    """Return response body lines without an envelope wrapper."""
+    return list(lines)
 
 
 def send_message(chat_id: int, text: str, parse_mode: str = "MarkdownV2") -> None:
-    """Send a text message to a chat."""
-    _api("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": parse_mode})
+    """Send a text message to a chat.
+
+    Telegram MarkdownV2 is strict; if parsing fails (400) we retry as plain text
+    so replies still get delivered.
+    """
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    try:
+        _api("sendMessage", payload)
+    except requests.HTTPError as e:
+        resp = getattr(e, "response", None)
+        if parse_mode and resp is not None and resp.status_code == 400:
+            logger.warning("sendMessage rejected with parse_mode=%s; retrying as plain text", parse_mode)
+            _api("sendMessage", {"chat_id": chat_id, "text": text})
+        else:
+            raise
 
 
 def send_help(chat_id: int) -> None:
@@ -499,6 +527,98 @@ def send_help(chat_id: int) -> None:
 # ---------------------------------------------------------------------------
 # Background scheduler (fires due reminders)
 # ---------------------------------------------------------------------------
+def _get_known_chat_ids() -> list[int]:
+    """Return chat/user IDs known from reminders, conversations, or profile."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT DISTINCT user_id FROM reminders
+        UNION
+        SELECT DISTINCT user_id FROM conversations
+        UNION
+        SELECT DISTINCT user_id FROM profile
+        """
+    )
+    rows = [r[0] for r in cur.fetchall()]
+    conn.close()
+    return [int(r) for r in rows if r is not None]
+
+
+def _build_agenda_text(chat_id: int) -> Optional[str]:
+    """Build a daily agenda/check-in message for a chat, or None if nothing useful."""
+    now = datetime.datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    reminders = get_reminders(chat_id, status="pending")
+    today_items = [r for r in reminders if r.get("due_at") and r["due_at"].startswith(today)]
+    undated = [r for r in reminders if not r.get("due_at")]
+
+    if not reminders:
+        return None
+
+    lines = ["**Daily agenda**"]
+    if today_items:
+        lines.append("")
+        lines.append("Today:")
+        for r in today_items:
+            dt = datetime.datetime.fromisoformat(r["due_at"])
+            lines.append(f"- {dt.strftime('%H:%M')} — {r['content']}")
+    else:
+        lines.append("")
+        lines.append("No timed items scheduled for today.")
+
+    if undated:
+        lines.append("")
+        lines.append("Pending without a time:")
+        for r in undated[:5]:
+            lines.append(f"- {r['content']}")
+        if len(undated) > 5:
+            lines.append(f"- ...and {len(undated) - 5} more")
+
+    # Gentle check-in note
+    if not today_items and undated:
+        lines.append("")
+        lines.append("Want me to help you pick a time for any of these?")
+
+    return "\n".join(lines)
+
+
+def _send_daily_agendas_if_due(now: datetime.datetime) -> None:
+    """Send proactive daily agenda/check-in messages at the configured time."""
+    enabled = os.getenv("DAILY_AGENDA_ENABLED", "true").lower() in ("1", "true", "yes")
+    if not enabled:
+        return
+    time_str = os.getenv("DAILY_AGENDA_TIME", "08:00").strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})$", time_str)
+    if not m:
+        hh, mm = 8, 0
+    else:
+        hh, mm = int(m.group(1)), int(m.group(2))
+    if now.hour != hh or now.minute != mm:
+        return
+
+    today = now.strftime("%Y-%m-%d")
+    for chat_id in _get_known_chat_ids():
+        try:
+            profile = get_profile(chat_id)
+            last = (profile.get("last_agenda_date") or {}).get("value")
+            if last == today:
+                continue
+            # Be conservative in groups: only send if there are reminders for the chat
+            if chat_id < 0 and not get_reminders(chat_id, status="pending"):
+                continue
+            agenda = _build_agenda_text(chat_id)
+            if not agenda:
+                # Still mark as sent to avoid repeated checks today
+                set_profile(chat_id, "last_agenda_date", today, source="default")
+                continue
+            send_message(chat_id, agenda, parse_mode=None)
+            set_profile(chat_id, "last_agenda_date", today, source="default")
+            logger.info("Sent daily agenda to chat %s", chat_id)
+        except Exception as e:
+            logger.error("Failed to send daily agenda to %s: %s", chat_id, e)
+
+
 def scheduler_loop() -> None:
     """Poll every 30s: fire due-time reminders, watch for recurring ones.
     Timers are compared in the same local wall-clock time the reminder was
@@ -539,21 +659,23 @@ def scheduler_loop() -> None:
             )
             recur_rows = cur.fetchall()
 
+            conn.close()
+
             # 3. Reschedule recurring reminders (next occurrence)
             for row in recur_rows:
                 rid, uid, content, due_at = row["id"], row["user_id"], row["content"], row["due_at"]
                 recur = get_recurrence_type(row["recurrence"])
                 next_due = compute_next_due(due_at, recur)
-                conn = sqlite3.connect(DB_PATH)
-                cur = conn.cursor()
-                cur.execute(
+                conn2 = sqlite3.connect(DB_PATH)
+                cur2 = conn2.cursor()
+                cur2.execute(
                     """UPDATE reminders
                        SET due_at = ?, status = 'pending', id = ?
                        WHERE id = ?""",
                     (next_due, rid, rid),
                 )
-                conn.commit()
-                conn.close()
+                conn2.commit()
+                conn2.close()
                 try:
                     send_message(uid, "\n".join(_response([
                         _section("RECURRING REMINDER"),
@@ -568,11 +690,11 @@ def scheduler_loop() -> None:
                 uid = row["user_id"]
                 content = row["content"]
                 kind = row["kind"] if row["kind"] in ("reminder", "timer", "alarm") else "reminder"
-                conn = sqlite3.connect(DB_PATH)
-                cur = conn.cursor()
-                cur.execute("UPDATE reminders SET status = 'done' WHERE id = ?", (rid,))
-                conn.commit()
-                conn.close()
+                conn2 = sqlite3.connect(DB_PATH)
+                cur2 = conn2.cursor()
+                cur2.execute("UPDATE reminders SET status = 'done' WHERE id = ?", (rid,))
+                conn2.commit()
+                conn2.close()
                 try:
                     icon = {"alarm": "🔔", "timer": "⏰", "reminder": "⏰"}.get(kind, "⏰")
                     send_message(uid, "\n".join(_response([
@@ -581,6 +703,12 @@ def scheduler_loop() -> None:
                     ])))
                 except Exception as e:
                     logger.error("Failed to send one-off %s to %s: %s", rid, uid, e)
+
+            # 5. Proactive daily agenda/check-ins
+            try:
+                _send_daily_agendas_if_due(now)
+            except Exception as e:
+                logger.error("Daily agenda check failed: %s", e)
 
         except Exception as e:
             logger.error("Scheduler error: %s", e)
@@ -689,6 +817,39 @@ def _cmd_add(chat_id: int, args: list[str]) -> None:
         ])))
 
 
+def _format_reminders_text(user_id: int) -> str:
+    reminders = get_reminders(user_id, status="pending")
+    if not reminders:
+        return "You have no pending reminders."
+    lines = []
+    for r in reminders:
+        line = f"- {r['content']}"
+        if r.get("due_at"):
+            dt = datetime.datetime.fromisoformat(r["due_at"])
+            line += f" (due {dt.strftime('%Y-%m-%d %H:%M')})"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _format_schedule_text(user_id: int) -> str:
+    now = datetime.datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    all_rem = get_reminders(user_id, status="pending")
+    today_rems = [r for r in all_rem if r.get("due_at") and r["due_at"].startswith(today)]
+    if not today_rems:
+        return "Today's schedule is empty."
+    lines = []
+    for entry in today_rems:
+        due = entry.get("due_at")
+        content = entry.get("content", "")
+        if due:
+            dt = datetime.datetime.fromisoformat(due)
+            lines.append(f"- {dt.strftime('%H:%M')} — {content}")
+        else:
+            lines.append(f"- {content}")
+    return "\n".join(lines)
+
+
 def _cmd_list(chat_id: int) -> None:
     """Show all pending reminders for the user, each with an ID (hierarchical)."""
     reminders = get_reminders(chat_id, status="pending")
@@ -794,6 +955,161 @@ def _cmd_delete(chat_id: int, args: list[str]) -> None:
         ])))
 
 
+def _extract_tool_call(text: str):
+    """Parse a tool call from model output.
+
+    Expected JSON: {"tool":"name","args":{...}}
+    """
+    if not text:
+        return None
+    s = text.strip()
+    # Try whole message first, then fenced/embedded JSON object.
+    candidates = [s]
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", s, re.DOTALL | re.IGNORECASE)
+    if m:
+        candidates.insert(0, m.group(1).strip())
+    if "{" in s and "}" in s:
+        start = s.find("{")
+        end = s.rfind("}") + 1
+        if start >= 0 and end > start:
+            candidates.append(s[start:end])
+    for cand in candidates:
+        try:
+            obj = json.loads(cand)
+        except Exception:
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("tool"), str):
+            args = obj.get("args") or {}
+            if not isinstance(args, dict):
+                args = {}
+            return obj["tool"], args
+    return None
+
+
+def _execute_assistant_tool(user_id: int, tool: str, args: dict) -> str:
+    """Execute a supported assistant tool and return a textual result."""
+    try:
+        if tool == "list_reminders":
+            return _format_reminders_text(user_id)
+        if tool == "get_schedule":
+            return _format_schedule_text(user_id)
+        if tool == "get_current_time":
+            return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if tool == "get_weather":
+            city = str(args.get("city") or "").strip()
+            if not city:
+                return "Missing required argument: city"
+            return _get_weather_text(city)
+        if tool == "add_reminder":
+            content = str(args.get("content") or args.get("text") or "").strip()
+            when = str(args.get("when") or args.get("time") or "").strip()
+            if not content:
+                return "Missing required argument: content"
+            due_at = _extract_reminder_time(when) if when else None
+            if due_at is None and when:
+                # Try parsing absolute HH:MM via existing logic by synthesizing text
+                due_at = _extract_reminder_time(content + " " + when)
+            if due_at is None:
+                add_reminder(user_id, content, None)
+                return f"Reminder added (no due time parsed): {content}"
+            add_reminder(user_id, content, due_at)
+            return f"Reminder set for {due_at}: {content}"
+        return f"Unknown tool: {tool}"
+    except Exception as e:
+        logger.error("Tool execution failed (%s): %s", tool, e)
+        return f"Tool '{tool}' failed: {e}"
+
+
+def _extract_llm_reply(data: dict) -> str:
+    return ((data.get("choices") or [{}])[0].get("message", {}).get("content", "") or "").strip()
+
+
+def _polish_llm_reply(reply: str) -> str:
+    if not reply:
+        return ""
+    # Unwrap common markdown fencing the model may have added
+    if len(reply) > 6 and reply.startswith("```") and reply.endswith("```"):
+        reply = reply[3:-3].strip()
+    elif len(reply) >= 2 and reply.startswith("`") and reply.endswith("`"):
+        reply = reply[1:-1].strip()
+    # Collapse internal whitespace but preserve line breaks so hierarchy
+    # (indentation, numbered sections, sub-details) is not destroyed.
+    return "\n".join(" ".join(line.split()) for line in reply.splitlines())
+
+
+def _chat_complete_with_backends(backends, messages, temperature):
+    """Return (reply_text, backend_name) or (None, last_error)."""
+    last_error = None
+    for backend in backends:
+        max_attempts = 2
+        for attempt in range(max_attempts):
+            req_messages = list(messages)
+            if attempt == 1 and req_messages and req_messages[-1].get("role") == "user":
+                req_messages[-1] = {
+                    "role": "user",
+                    "content": req_messages[-1]["content"] + "\n\n(Reply with a single, clear, natural answer.)",
+                }
+            try:
+                headers = {"Content-Type": "application/json"}
+                headers.update(backend.get("headers") or {})
+                if backend.get("api_key"):
+                    headers["Authorization"] = f"Bearer {backend['api_key']}"
+
+                resp = requests.post(
+                    backend["base_url"] + "/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": backend["model"],
+                        "messages": req_messages,
+                        "temperature": temperature,
+                    },
+                    timeout=90,
+                )
+                response_body = resp.text
+                gateway_draining = re.search(r"Gateway draining:\s*not_ready", response_body, re.IGNORECASE)
+                retryable_status = resp.status_code in (408, 425, 429) or resp.status_code >= 500
+                if gateway_draining or retryable_status:
+                    last_error = RuntimeError(
+                        f"[{backend['name']}] LLM API error {resp.status_code}: {response_body[:500]}"
+                    )
+                    if attempt + 1 < max_attempts:
+                        retry_after = resp.headers.get("Retry-After")
+                        try:
+                            delay = min(max(float(retry_after), 0), 30) if retry_after else 2 ** attempt
+                        except ValueError:
+                            delay = 2 ** attempt
+                        logger.warning(
+                            "LLM backend '%s' temporarily unavailable; retrying in %.1f seconds (attempt %d/%d)",
+                            backend["name"], delay, attempt + 2, max_attempts,
+                        )
+                        time.sleep(delay)
+                        continue
+                    logger.error("LLM backend '%s' failed after retries: %s", backend["name"], last_error)
+                    break
+
+                if resp.status_code >= 400:
+                    last_error = RuntimeError(
+                        f"[{backend['name']}] LLM API error {resp.status_code}: {response_body[:500]}"
+                    )
+                    logger.error("Plain-text reply failed on '%s': %s", backend["name"], last_error)
+                    break
+
+                reply = _polish_llm_reply(_extract_llm_reply(resp.json()))
+                if reply:
+                    return reply, backend["name"]
+                last_error = RuntimeError(f"[{backend['name']}] model returned an empty reply")
+                logger.error("Plain-text reply failed on '%s': %s", backend["name"], last_error)
+                break
+            except Exception as e:
+                last_error = e
+                logger.error("Plain-text reply failed on '%s': %s", backend["name"], e)
+                break
+
+        if backend["name"] != backends[-1]["name"]:
+            logger.warning("Falling back from '%s' to next LLM backend after error: %s", backend["name"], last_error)
+    return None, last_error
+
+
 def reply_plain_text(chat_id: int, text: str, user_id: Optional[int] = None) -> None:
     """Reply to free-form chat messages through the local AI model.
 
@@ -817,20 +1133,50 @@ def reply_plain_text(chat_id: int, text: str, user_id: Optional[int] = None) -> 
     for key, value in extract_profile_facts(user_id, get_conversation_history(user_id, limit=6)):
         set_profile(user_id, key, value, source="learned")
 
-    base_url = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
-    model = os.getenv("LLM_MODEL", "phi4-mini:3.8b")
     temperature = float(os.getenv("LLM_TEMPERATURE", "0.7"))
+
+    # LLM backends in priority order:
+    # 1) Primary: local Ollama (or any OpenAI-compatible endpoint)
+    # 2) Fallback: OpenRouter with a Nous model (used when primary is unavailable/fails)
+    openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    backends = [
+        {
+            "name": "ollama",
+            "base_url": os.getenv("LLM_BASE_URL", "http://localhost:11434/v1").rstrip("/"),
+            "model": os.getenv("LLM_MODEL", "phi4-mini:3.8b"),
+            "api_key": os.getenv("LLM_API_KEY", "").strip() or None,
+            "headers": {},
+        },
+    ]
+    if openrouter_key:
+        backends.append(
+            {
+                "name": "openrouter",
+                "base_url": os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/"),
+                "model": os.getenv("OPENROUTER_MODEL", "nousresearch/hermes-4-70b"),
+                "api_key": openrouter_key,
+                "headers": {
+                    "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "https://telegram-secretary-bot.local"),
+                    "X-Title": os.getenv("OPENROUTER_APP_NAME", "Telegram Secretary Bot"),
+                },
+            }
+        )
 
     system_prompt = """You are a friendly, conversational Telegram personal assistant.
 
-RESPONSE OUTLINING PROTOCOL (INVARIANT):
-Every reply MUST start with "═══ RESPONSE ═══" and end with "═══ END ═══".
-Use bold markdown headers (**Header**) for each category.
-Under each header, list individual items as bullet points (- item).
-Leave a blank line between each section for maximum readability.
-Keep bullets concise — one line each where possible.
-If the user asks for a list or bullets, expand every item into its own line
-under the proper section, adding sub-detail lines where useful.
+You can help with reminders, schedules, weather, and general chat.
+When the user's request requires an action you can perform, you may call a tool by responding with ONLY a JSON object (no extra text):
+{"tool":"<name>","args":{...}}
+
+Available tools:
+- list_reminders: args {}
+- get_schedule: args {}  (today's schedule)
+- get_current_time: args {}
+- get_weather: args {"city":"<city name>"}
+- add_reminder: args {"content":"<what to remind>", "when":"<time like 'in 10 minutes', 'tomorrow', 'at 7pm'>"} 
+
+If no tool is needed, answer the user directly in plain text.
+After a tool result is provided, give a clear, helpful final answer to the user (not JSON).
 
 Rules:
 - Keep it short and match the length of the question.
@@ -844,77 +1190,43 @@ Rules:
     if profile_summary:
         system_prompt += "\n\n" + profile_summary
 
-    def extract_reply(data):
-        return ((data.get("choices") or [{}])[0].get("message", {}).get("content", "") or "").strip()
+    messages = (
+        [{"role": "system", "content": system_prompt}]
+        + [{"role": role, "content": content} for role, content in prior]
+        + [{"role": "user", "content": text}]
+    )
 
-    def polish(reply):
+    reply, _backend = _chat_complete_with_backends(backends, messages, temperature)
+    if not reply:
+        send_message(chat_id, "Sorry, I wasn't able to reply just now — could you try rephrasing or ask again in a moment?")
+        return
+
+    # Tool-use loop (simple, model-agnostic JSON protocol)
+    for _ in range(2):
+        tool_call = _extract_tool_call(reply)
+        if not tool_call:
+            break
+        tool_name, tool_args = tool_call
+        tool_result = _execute_assistant_tool(user_id, tool_name, tool_args)
+        messages = messages + [
+            {"role": "assistant", "content": reply},
+            {"role": "user", "content": f"Tool result for {tool_name}: {tool_result}\n\nNow reply to the user with the final answer."},
+        ]
+        reply, _backend = _chat_complete_with_backends(backends, messages, temperature)
         if not reply:
-            return ""
-        # Unwrap common markdown fencing the model may have added
-        if len(reply) > 6 and reply.startswith("```") and reply.endswith("```"):
-            reply = reply[3:-3].strip()
-        elif len(reply) >= 2 and reply.startswith("`") and reply.endswith("`"):
-            reply = reply[1:-1].strip()
-        # Collapse internal whitespace but preserve line breaks so hierarchy
-        # (indentation, numbered sections, sub-details) is not destroyed.
-        return "\n".join(" ".join(line.split()) for line in reply.splitlines())
+            send_message(chat_id, "Sorry, I wasn't able to reply just now — could you try rephrasing or ask again in a moment?")
+            return
 
-    last_error = None
-    max_attempts = 3
-    for attempt in range(max_attempts):
-        user_content = text
-        if attempt == 1:
-            user_content = text + "\n\n(Reply with a single, clear, natural answer.)"
+    try:
+        send_message(chat_id, reply)
+    except Exception as send_err:
+        logger.error("Failed to deliver LLM reply: %s", send_err)
         try:
-            resp = requests.post(
-                base_url + "/chat/completions",
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                    ]
-                    + [{"role": role, "content": content} for role, content in prior]
-                    + [{"role": "user", "content": user_content}],
-                    "temperature": temperature,
-                },
-                timeout=90,
-            )
-            response_body = resp.text
-            gateway_draining = re.search(r"Gateway draining:\s*not_ready", response_body, re.IGNORECASE)
-            retryable_status = resp.status_code in (408, 425, 429) or resp.status_code >= 500
-            if gateway_draining or retryable_status:
-                last_error = RuntimeError(
-                    f"LLM API error {resp.status_code}: {response_body[:500]}"
-                )
-                if attempt + 1 < max_attempts:
-                    retry_after = resp.headers.get("Retry-After")
-                    try:
-                        delay = min(max(float(retry_after), 0), 30) if retry_after else 2 ** attempt
-                    except ValueError:
-                        delay = 2 ** attempt
-                    logger.warning(
-                        "LLM gateway temporarily unavailable; retrying in %.1f seconds (attempt %d/%d)",
-                        delay,
-                        attempt + 2,
-                        max_attempts,
-                    )
-                    time.sleep(delay)
-                    continue
-                logger.error("Plain-text reply failed after retries: %s", last_error)
-                break
-
-            resp.raise_for_status()
-            reply = polish(extract_reply(resp.json()))
-            if reply:
-                send_message(chat_id, reply)
-                record_conversation(user_id, "assistant", reply)
-                return
-            last_error = "model returned an empty reply"
-        except Exception as e:
-            last_error = e
-            logger.error("Plain-text reply failed: %s", e)
-
-    send_message(chat_id, "Sorry, I wasn't able to reply just now — could you try rephrasing or ask again in a moment?")
+            send_message(chat_id, "I generated a reply but couldn't deliver it just now. Please try again.", parse_mode=None)
+        except Exception:
+            pass
+    else:
+        record_conversation(user_id, "assistant", reply)
 
 
 def _cmd_clear(chat_id: int) -> None:
@@ -1125,14 +1437,20 @@ def _extract_reminder_time(text: str) -> Optional[str]:
             due += datetime.timedelta(days=1)
         return due.isoformat()
 
-    # Numeric units (minutes / hours / days).
+    # Numeric units (minutes / hours / days / seconds).
     m = re.search(r"\b(\d+)\s*(minutes?|mins?|hours?|hrs?|days?|seconds?|secs?)\b", t_lower)
     if m:
         n = int(m.group(1))
-        unit = m.group(2)
-        mult = {"minutes": 60, "mins": 60, "hours": 3600, "hrs": 3600,
-                "days": 86400, "seconds": 1, "secs": 1}[unit]
-        return _floor_time(now + datetime.timedelta(seconds=n * mult)).isoformat()
+        unit = m.group(2).lower()
+        mult_map = {
+            "minute": 60, "minutes": 60, "min": 60, "mins": 60,
+            "hour": 3600, "hours": 3600, "hr": 3600, "hrs": 3600,
+            "day": 86400, "days": 86400,
+            "second": 1, "seconds": 1, "sec": 1, "secs": 1,
+        }
+        mult = mult_map.get(unit)
+        if mult is not None:
+            return _floor_time(now + datetime.timedelta(seconds=n * mult)).isoformat()
 
     return None
 
@@ -1215,14 +1533,10 @@ def _weather_desc(code):
     return WEATHER_CODES.get(code, "Unknown")
 
 
-def _send_weather(chat_id, city):
+def _get_weather_text(city: str) -> str:
     coords = _get_city_coords(city)
     if not coords:
-        send_message(chat_id, "\n".join(_response([
-            _section("WEATHER"),
-            _item(f"Sorry, I couldn't find a weather forecast for “{city}.”", level=1),
-        ])))
-        return
+        return f"Sorry, I couldn't find a weather forecast for “{city}”."
     lat, lon, resolved = coords
     try:
         resp = requests.get(
@@ -1238,11 +1552,7 @@ def _send_weather(chat_id, city):
         data = resp.json()["current"]
     except Exception as e:
         logger.error("Weather forecast failed for %r: %s", city, e)
-        send_message(chat_id, "\n".join(_response([
-            _section("WEATHER"),
-            _item("Sorry, I couldn't fetch the weather right now.", level=1),
-        ])))
-        return
+        return "Sorry, I couldn't fetch the weather right now."
 
     code = data.get("weather_code")
     temp = data.get("temperature_2m")
@@ -1250,16 +1560,21 @@ def _send_weather(chat_id, city):
     hum = data.get("relative_humidity_2m")
     prec = data.get("precipitation")
 
-    parts = [f"☀️ {resolved}: {temp}°C"]
+    parts = [f"{resolved}: {temp}°C"]
     if feel is not None and feel != temp:
         parts.append(f"feels like {feel}°C")
     if hum is not None:
         parts.append(f"humidity {hum}%")
     if prec is not None and prec > 0:
         parts.append(f"precipitation {prec} mm")
+    return " • ".join(parts) + " — " + _weather_desc(code)
+
+
+def _send_weather(chat_id, city):
+    text = _get_weather_text(city)
     send_message(chat_id, "\n".join(_response([
         _section("WEATHER"),
-        _item(" • ".join(parts) + " — " + _weather_desc(code), level=1),
+        _item(text, level=1),
     ])))
 
 
@@ -1341,14 +1656,82 @@ def _dispatch_nl(chat_id, text, user_id: Optional[int] = None):
 # ---------------------------------------------------------------------------
 # Command handler
 # ---------------------------------------------------------------------------
-def handle_message(chat_id: int, text: str, user_id: Optional[int] = None) -> None:
+def _normalize_command_token(token: str) -> str:
+    """Normalize '/cmd@BotName' to '/cmd' for matching."""
+    cmd = token.lower()
+    if "@" in cmd:
+        cmd = cmd.split("@", 1)[0]
+    return cmd
+
+
+def _is_group_chat(chat_type: Optional[str], chat_id: int) -> bool:
+    if chat_type in ("group", "supergroup"):
+        return True
+    return chat_id < 0
+
+
+def should_respond_in_chat(msg: dict, text: str) -> bool:
+    """Decide if the bot should respond to a message.
+
+    - Private chats: respond to messages with text.
+    - Group/supergroup chats: respond only when explicitly addressed
+      (command, @mention, or reply to the bot) to avoid interrupting chatter.
+    """
+    chat = msg.get("chat", {}) or {}
+    chat_id = chat.get("id")
+    chat_type = chat.get("chat_type") or chat.get("type")
+    if not _is_group_chat(chat_type, chat_id if isinstance(chat_id, int) else 0):
+        return True
+
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+
+    # Commands in groups (including /cmd@BotName)
+    if stripped.startswith("/"):
+        return True
+
+    # Reply to a bot message
+    reply_to = msg.get("reply_to_message") or {}
+    reply_from = reply_to.get("from") or {}
+    if reply_from.get("is_bot"):
+        bot_username = (get_bot_username() or "").lower()
+        reply_username = (reply_from.get("username") or "").lower()
+        if not bot_username or reply_username == bot_username:
+            return True
+
+    # @mention in text/entities
+    bot_username = (get_bot_username() or "").lower()
+    if bot_username and f"@{bot_username}" in stripped.lower():
+        return True
+    for ent in (msg.get("entities") or []):
+        if ent.get("type") == "mention":
+            off = ent.get("offset", 0)
+            ln = ent.get("length", 0)
+            mention = stripped[off:off + ln].lower()
+            if bot_username and mention == f"@{bot_username}":
+                return True
+        if ent.get("type") == "text_mention":
+            user = ent.get("user") or {}
+            if user.get("is_bot"):
+                uname = (user.get("username") or "").lower()
+                if bot_username and uname == bot_username:
+                    return True
+
+    return False
+
+
+def handle_message(chat_id: int, text: str, user_id: Optional[int] = None, chat_type: Optional[str] = None) -> None:
     """Dispatch inbound message text to the right handler."""
     parts = text.strip().split()
-    cmd = parts[0].lower()
+    cmd = _normalize_command_token(parts[0]) if parts else ""
     args = parts[1:]
 
     if user_id is None:
         user_id = chat_id
+
+    # In groups, allow commands and direct mentions/replies; plain chatter is ignored
+    # before reaching here by run_bot/should_respond_in_chat.
 
     if cmd in ("/start", "/help"):
         send_help(chat_id)
@@ -1534,6 +1917,9 @@ def run_bot() -> None:
     """Start long-polling the Telegram API and dispatch messages."""
     init_db()
 
+    # Cache bot identity for group chat mention/reply handling
+    get_bot_username()
+
     # Start the background scheduler
     scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
     scheduler_thread.start()
@@ -1547,15 +1933,20 @@ def run_bot() -> None:
             resp = _api(
                 "getUpdates",
                 {"offset": offset, "timeout": 30, "allowed_updates": ["message"]},
+                timeout=45,
             )
             for upd in resp.get("result", []):
                 offset = upd["update_id"] + 1
                 msg = upd.get("message", {})
-                chat_id = msg.get("chat", {}).get("id")
-                text = msg.get("text", "").strip()
+                chat = msg.get("chat", {}) or {}
+                chat_id = chat.get("id")
+                chat_type = chat.get("type")
+                text = (msg.get("text") or "").strip()
                 if chat_id and text:
-                    from_id = msg.get("from", {}).get("id")
-                    handle_message(chat_id, text, user_id=from_id)
+                    if not should_respond_in_chat(msg, text):
+                        continue
+                    from_id = (msg.get("from") or {}).get("id")
+                    handle_message(chat_id, text, user_id=from_id, chat_type=chat_type)
         except Exception as e:
             logger.error("Polling error: %s", e)
             time.sleep(5)
