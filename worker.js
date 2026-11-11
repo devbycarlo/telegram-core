@@ -41,10 +41,52 @@
 
 const TELEGRAM_API_BASE = 'https://api.telegram.org';
 const LAST_UPDATE_ID_KEY = 'meta:last_update_id';
+const LLM_MAX_ATTEMPTS = 3;
 
 // ---------------------------------------------------------------------------
 // Helpers (env is passed explicitly — never stored in module scope)
 // ---------------------------------------------------------------------------
+
+async function fetchLlmWithRetry(url, options) {
+  let lastError;
+
+  for (let attempt = 0; attempt < LLM_MAX_ATTEMPTS; attempt++) {
+    let response;
+    try {
+      response = await fetch(url, options);
+    } catch (err) {
+      lastError = err;
+      if (attempt === LLM_MAX_ATTEMPTS - 1) throw err;
+    }
+
+    if (response) {
+      const body = await response.clone().text().catch(() => '');
+      const draining = /Gateway draining:\s*not_ready/i.test(body);
+      const retryableStatus = response.status === 408 || response.status === 425 ||
+        response.status === 429 || response.status >= 500;
+
+      if (!draining && !retryableStatus) return response;
+      if (attempt === LLM_MAX_ATTEMPTS - 1) return response;
+
+      const retryAfterHeader = response.headers.get('Retry-After');
+      const retryAfterSeconds = Number(retryAfterHeader);
+      const retryAfterMs = retryAfterHeader
+        ? Number.isFinite(retryAfterSeconds)
+          ? retryAfterSeconds * 1000
+          : Date.parse(retryAfterHeader) - Date.now()
+        : NaN;
+      const delayMs = Number.isFinite(retryAfterMs)
+        ? Math.min(Math.max(retryAfterMs, 0), 2000)
+        : 250 * (2 ** attempt);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      continue;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 250 * (2 ** attempt)));
+  }
+
+  throw lastError || new Error('LLM request failed after retries.');
+}
 
 /** Send a message to a Telegram chat. */
 async function sendMessage(env, chatId, text, parseMode = 'Markdown') {
@@ -499,7 +541,7 @@ const COMMANDS = {
       }
 
       try {
-        const resp = await fetch(baseUrl + endpoint, {
+        const resp = await fetchLlmWithRetry(baseUrl + endpoint, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -516,6 +558,9 @@ const COMMANDS = {
         }
 
         const data = await resp.json();
+        if (data.error?.message) {
+          throw new Error(data.error.message);
+        }
 
         // Extract response text - handle both OpenAI and Ollama formats
         let text;
