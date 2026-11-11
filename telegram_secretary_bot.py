@@ -860,7 +860,8 @@ Rules:
         return "\n".join(" ".join(line.split()) for line in reply.splitlines())
 
     last_error = None
-    for attempt in range(2):
+    max_attempts = 3
+    for attempt in range(max_attempts):
         user_content = text
         if attempt == 1:
             user_content = text + "\n\n(Reply with a single, clear, natural answer.)"
@@ -878,6 +879,30 @@ Rules:
                 },
                 timeout=90,
             )
+            response_body = resp.text
+            gateway_draining = re.search(r"Gateway draining:\s*not_ready", response_body, re.IGNORECASE)
+            retryable_status = resp.status_code in (408, 425, 429) or resp.status_code >= 500
+            if gateway_draining or retryable_status:
+                last_error = RuntimeError(
+                    f"LLM API error {resp.status_code}: {response_body[:500]}"
+                )
+                if attempt + 1 < max_attempts:
+                    retry_after = resp.headers.get("Retry-After")
+                    try:
+                        delay = min(max(float(retry_after), 0), 30) if retry_after else 2 ** attempt
+                    except ValueError:
+                        delay = 2 ** attempt
+                    logger.warning(
+                        "LLM gateway temporarily unavailable; retrying in %.1f seconds (attempt %d/%d)",
+                        delay,
+                        attempt + 2,
+                        max_attempts,
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.error("Plain-text reply failed after retries: %s", last_error)
+                break
+
             resp.raise_for_status()
             reply = polish(extract_reply(resp.json()))
             if reply:
