@@ -545,8 +545,8 @@ def _get_known_chat_ids() -> list[int]:
     return [int(r) for r in rows if r is not None]
 
 
-def _build_agenda_text(chat_id: int) -> Optional[str]:
-    """Build a daily agenda/check-in message for a chat, or None if nothing useful."""
+def _build_proactive_text(chat_id: int, kind: str = "agenda") -> Optional[str]:
+    """Build a proactive agenda or check-in message for a chat, or None if nothing useful."""
     now = datetime.datetime.now()
     today = now.strftime("%Y-%m-%d")
     reminders = get_reminders(chat_id, status="pending")
@@ -556,11 +556,47 @@ def _build_agenda_text(chat_id: int) -> Optional[str]:
     if not reminders:
         return None
 
+    if kind == "checkin":
+        title = "Quick check-in"
+        if not today_items and not undated:
+            return None
+        lines = [f"**{title}**"]
+        remaining_today = []
+        for r in today_items:
+            try:
+                dt = datetime.datetime.fromisoformat(r["due_at"])
+                if dt >= now:
+                    remaining_today.append((dt, r))
+            except Exception:
+                remaining_today.append((None, r))
+        if remaining_today:
+            lines.append("")
+            lines.append("Still coming up today:")
+            for dt, r in sorted(remaining_today, key=lambda x: x[0] or now):
+                if dt:
+                    lines.append(f"- {dt.strftime('%H:%M')} — {r['content']}")
+                else:
+                    lines.append(f"- {r['content']}")
+        elif today_items:
+            lines.append("")
+            lines.append("Today's timed items have passed or been handled.")
+        if undated:
+            lines.append("")
+            lines.append("Pending without a time:")
+            for r in undated[:5]:
+                lines.append(f"- {r['content']}")
+            if len(undated) > 5:
+                lines.append(f"- ...and {len(undated) - 5} more")
+        lines.append("")
+        lines.append("Need help tackling any of these?")
+        return "\n".join(lines)
+
+    # agenda
     lines = ["**Daily agenda**"]
     if today_items:
         lines.append("")
         lines.append("Today:")
-        for r in today_items:
+        for r in sorted(today_items, key=lambda x: x.get("due_at") or ""):
             dt = datetime.datetime.fromisoformat(r["due_at"])
             lines.append(f"- {dt.strftime('%H:%M')} — {r['content']}")
     else:
@@ -575,7 +611,6 @@ def _build_agenda_text(chat_id: int) -> Optional[str]:
         if len(undated) > 5:
             lines.append(f"- ...and {len(undated) - 5} more")
 
-    # Gentle check-in note
     if not today_items and undated:
         lines.append("")
         lines.append("Want me to help you pick a time for any of these?")
@@ -583,17 +618,40 @@ def _build_agenda_text(chat_id: int) -> Optional[str]:
     return "\n".join(lines)
 
 
-def _send_daily_agendas_if_due(now: datetime.datetime) -> None:
-    """Send proactive daily agenda/check-in messages at the configured time."""
-    enabled = os.getenv("DAILY_AGENDA_ENABLED", "true").lower() in ("1", "true", "yes")
+def _parse_hhmm(time_str: str, default_hh: int, default_mm: int) -> tuple[int, int]:
+    m = re.match(r"^(\d{1,2}):(\d{2})$", (time_str or "").strip())
+    if not m:
+        return default_hh, default_mm
+    return int(m.group(1)), int(m.group(2))
+
+
+def _group_proactive_allowed(chat_id: int, kind: str) -> bool:
+    """Whether proactive messages are allowed for this chat (configurable for groups)."""
+    if chat_id >= 0:
+        return True
+    mode = os.getenv("GROUP_PROACTIVE_MODE", "reminders_only").strip().lower()
+    if mode == "off":
+        return False
+    if mode == "always":
+        return True
+    # reminders_only (default): only if the group has pending reminders
+    return bool(get_reminders(chat_id, status="pending"))
+
+
+def _send_proactive_if_due(now: datetime.datetime, kind: str) -> None:
+    """Send proactive agenda/check-in messages at configured times."""
+    if kind == "checkin":
+        enabled = os.getenv("DAILY_CHECKIN_ENABLED", "true").lower() in ("1", "true", "yes")
+        hh, mm = _parse_hhmm(os.getenv("DAILY_CHECKIN_TIME", "13:00"), 13, 0)
+        last_key = "last_checkin_date"
+    else:
+        enabled = os.getenv("DAILY_AGENDA_ENABLED", "true").lower() in ("1", "true", "yes")
+        hh, mm = _parse_hhmm(os.getenv("DAILY_AGENDA_TIME", "08:00"), 8, 0)
+        last_key = "last_agenda_date"
+        kind = "agenda"
+
     if not enabled:
         return
-    time_str = os.getenv("DAILY_AGENDA_TIME", "08:00").strip()
-    m = re.match(r"^(\d{1,2}):(\d{2})$", time_str)
-    if not m:
-        hh, mm = 8, 0
-    else:
-        hh, mm = int(m.group(1)), int(m.group(2))
     if now.hour != hh or now.minute != mm:
         return
 
@@ -601,22 +659,21 @@ def _send_daily_agendas_if_due(now: datetime.datetime) -> None:
     for chat_id in _get_known_chat_ids():
         try:
             profile = get_profile(chat_id)
-            last = (profile.get("last_agenda_date") or {}).get("value")
+            last = (profile.get(last_key) or {}).get("value")
             if last == today:
                 continue
-            # Be conservative in groups: only send if there are reminders for the chat
-            if chat_id < 0 and not get_reminders(chat_id, status="pending"):
+            if not _group_proactive_allowed(chat_id, kind):
+                set_profile(chat_id, last_key, today, source="default")
                 continue
-            agenda = _build_agenda_text(chat_id)
-            if not agenda:
-                # Still mark as sent to avoid repeated checks today
-                set_profile(chat_id, "last_agenda_date", today, source="default")
+            text = _build_proactive_text(chat_id, kind=kind)
+            if not text:
+                set_profile(chat_id, last_key, today, source="default")
                 continue
-            send_message(chat_id, agenda, parse_mode=None)
-            set_profile(chat_id, "last_agenda_date", today, source="default")
-            logger.info("Sent daily agenda to chat %s", chat_id)
+            send_message(chat_id, text, parse_mode=None)
+            set_profile(chat_id, last_key, today, source="default")
+            logger.info("Sent daily %s to chat %s", kind, chat_id)
         except Exception as e:
-            logger.error("Failed to send daily agenda to %s: %s", chat_id, e)
+            logger.error("Failed to send daily %s to %s: %s", kind, chat_id, e)
 
 
 def scheduler_loop() -> None:
@@ -706,9 +763,10 @@ def scheduler_loop() -> None:
 
             # 5. Proactive daily agenda/check-ins
             try:
-                _send_daily_agendas_if_due(now)
+                _send_proactive_if_due(now, kind="agenda")
+                _send_proactive_if_due(now, kind="checkin")
             except Exception as e:
-                logger.error("Daily agenda check failed: %s", e)
+                logger.error("Daily agenda/check-in failed: %s", e)
 
         except Exception as e:
             logger.error("Scheduler error: %s", e)
@@ -1055,6 +1113,7 @@ def _chat_complete_with_backends(backends, messages, temperature):
                 if backend.get("api_key"):
                     headers["Authorization"] = f"Bearer {backend['api_key']}"
 
+                max_tokens = int(os.getenv("LLM_MAX_TOKENS", "800"))
                 resp = requests.post(
                     backend["base_url"] + "/chat/completions",
                     headers=headers,
@@ -1062,6 +1121,7 @@ def _chat_complete_with_backends(backends, messages, temperature):
                         "model": backend["model"],
                         "messages": req_messages,
                         "temperature": temperature,
+                        "max_tokens": max_tokens,
                     },
                     timeout=90,
                 )
@@ -1153,7 +1213,7 @@ def reply_plain_text(chat_id: int, text: str, user_id: Optional[int] = None) -> 
             {
                 "name": "openrouter",
                 "base_url": os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/"),
-                "model": os.getenv("OPENROUTER_MODEL", "nousresearch/hermes-4-70b"),
+                "model": os.getenv("OPENROUTER_MODEL", "nousresearch/hermes-4-405b"),
                 "api_key": openrouter_key,
                 "headers": {
                     "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "https://telegram-secretary-bot.local"),
